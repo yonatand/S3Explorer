@@ -403,3 +403,68 @@ export interface RestoreRequest { tier: RestoreTier; days: number }
 export const RESTORE_DAYS = { min: 1, max: 365, default: 7 } as const;
 /** Storage classes whose objects need a restore before they can be read. */
 export const ARCHIVE_STORAGE_CLASSES = ["GLACIER", "DEEP_ARCHIVE"] as const;
+
+// ---- v0.6.0: search, and the Activity menu (see "v0.6.0 additions" in docs/CONTRACT.md) ----
+
+// Search in a bucket
+export interface SearchQuery {
+  bucket: string;
+  /** Prefix to search under; "" = the whole bucket. */
+  scope: string;
+  /** The query as typed; parsed by the backend (words, "phrases", -exclusions, tag:key=value, path terms). */
+  text: string;
+  /** Max hits, 1..=1000. */
+  limit: number;
+}
+
+export interface SearchTagTerm { key: string; value: string | null }
+
+export interface ParsedSearch {
+  /** Includes path terms; lowercased. */
+  words: string[];
+  phrases: string[];
+  excluded: string[];
+  tags: SearchTagTerm[];
+  /** Set when the whole query is one unquoted path term: tried as a key with HeadObject. */
+  exactPath: string | null;
+  /** The prefix the scan actually listed (scope, possibly narrowed by a path term). */
+  listPrefix: string;
+}
+
+export interface SearchHit {
+  entry: ObjectEntry;
+  /** Filled only when the query has tag terms. */
+  tags: Tag[] | null;
+  /** The HeadObject hit on `exactPath`. */
+  exact: boolean;
+}
+
+export interface SearchResult {
+  /** The exact hit first (if any), then in key order. */
+  hits: SearchHit[];
+  /** Keys the scan looked at. */
+  scanned: number;
+  /** GetObjectTagging calls made. */
+  tagLookups: number;
+  /** A cap stopped the search before the end of the listing. */
+  truncated: boolean;
+  /** Which cap, in words, when truncated. */
+  reason: string | null;
+  parsed: ParsedSearch;
+}
+
+export const SEARCH_LIMITS = {
+  /** Keys scanned per search before the result is truncated. */
+  maxScan: 50_000,
+  /** GetObjectTagging calls per search before the result is truncated. */
+  maxTagLookups: 2_000,
+  hits: { min: 1, max: 1000 },
+  /** What the UI asks for. */
+  uiLimit: 500,
+} as const;
+
+/** `open_local` refuses these extensions (case-insensitive): the file could run as a program. */
+export const OPEN_LOCAL_REFUSED_EXTENSIONS = [
+  "exe", "bat", "cmd", "com", "scr", "ps1", "psm1", "msi", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+  "jar", "sh", "command", "app", "reg", "lnk", "url",
+] as const;

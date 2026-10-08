@@ -35,6 +35,11 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
 22. (v0.5.0) Disconnect can cancel running work; notifications use OS window focus; deleting a saved
     connection forgets its added buckets.
 
+23. (v0.6.0) Search in a bucket: words, phrases, exclusions, `tag:key=value` and path terms over a bounded
+    scan of the current folder or the whole bucket (see "Search in a bucket" in `docs/CONTRACT.md`).
+24. (v0.6.0) A right-click menu on every Activity row: open the downloaded file or folder, show in folder, go
+    to the object, copy key / local path / failures, cancel, remove.
+
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.
 If a task seems to need one of these, stop and ask the user instead of adding it.

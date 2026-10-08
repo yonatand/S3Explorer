@@ -1045,3 +1045,154 @@ asks when anything is active: "N operations are still running." with **Cancel th
 - Queued transfer tasks are boxed so a 50,000-file batch does not hold 50,000 full-size futures.
 - Transfer-manager locks are never held across another lock; a stress test guards the ordering (a disconnect
   deadlock was found this way).
+
+## v0.6.0 additions — search, and the Activity menu
+
+Everything in this section is new in v0.6.0. Where it changes an earlier section, this section wins.
+
+### Search in a bucket
+
+S3 has no server-side search. Searching is a **bounded scan** of keys (the same mechanism as "Newest
+files"), narrowed as much as the query allows, with one query language that covers paths, keywords
+and tags:
+
+| Term | Meaning |
+|---|---|
+| `word` | the key contains `word` (case-insensitive, Unicode lowercase on both sides; no normalization) |
+| `"two words"` | the key contains the phrase, including the space |
+| `-word` / `-"phrase"` | the key does not contain it |
+| `tag:key=value` | the object has a tag with exactly that key (case-sensitive, as S3) and that value (case-insensitive) |
+| `tag:key` | the object has a tag with that key, any value |
+| a term with `/` (a **path term**) | matched like a word, and additionally used to narrow the listing (below) |
+
+Terms are separated by whitespace; every term must match (AND). A term is path-like when it contains
+`/` and is not quoted. Matching is always against the **full key** (so `invoice 2026` finds
+`billing/2026/invoice-0412.pdf`), never against a display name.
+
+```ts
+interface SearchQuery {
+  bucket: string;
+  scope: string;    // prefix to search under ("" = whole bucket); the UI sends the current folder or ""
+  text: string;     // the query as typed; the backend parses it
+  limit: number;    // max hits, 1..=1000; the UI sends 500
+}
+interface SearchTagTerm { key: string; value: string | null }
+interface ParsedSearch {
+  words: string[];          // includes path terms, lowercased
+  phrases: string[];        // lowercased
+  excluded: string[];       // lowercased words and phrases
+  tags: SearchTagTerm[];
+  exactPath: string | null; // set when the whole query is one unquoted path term: tried as a key with HeadObject
+  listPrefix: string;       // the prefix the scan actually listed (scope, possibly narrowed by a path term)
+}
+interface SearchHit {
+  entry: ObjectEntry;
+  tags: Tag[] | null;       // filled only when the query has tag terms
+  exact: boolean;           // true for the HeadObject hit on `exactPath`
+}
+interface SearchResult {
+  hits: SearchHit[];        // the exact hit first (if any), then in key order
+  scanned: number;          // keys the scan looked at (the exact-path HeadObject is not counted)
+  tagLookups: number;       // GetObjectTagging calls made
+  truncated: boolean;       // a cap stopped the search before the end of the listing
+  reason: string | null;    // which cap, in words, when truncated; e.g. "Stopped after scanning 50,000 objects"
+  parsed: ParsedSearch;
+}
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `search_objects` | `{ query: SearchQuery, searchId: string }` | `SearchResult`. A newer call with the same `searchId` cancels the older one, which fails with `Cancelled` (same rule as `preview_batch`), so typing never queues scans. An empty query (no terms after parsing) is `InvalidInput`. |
+
+Backend behavior:
+
+- **Narrowing.** The listing prefix starts as `scope`. If the query has a path term, let `dir` be the
+  term up to and including its last `/`: when `dir` starts with `scope`, list `dir` instead; when
+  `scope` starts with `dir`, keep `scope`; otherwise keep `scope` (the term can still match as a word).
+  With several path terms use the longest `dir` that qualifies. `parsed.listPrefix` reports the choice.
+- **Exact path.** When the whole query is a single unquoted path term, `HeadObject` that key first
+  (it may be outside `scope`; the key is sent byte-for-byte as typed, never normalized). A hit becomes
+  `hits[0]` with `exact: true`; `NoSuchKey` and `AccessDenied` on the head are not errors. The scan
+  still runs and skips that key if it meets it again.
+- **Scan caps.** Stop after **50,000 keys** scanned, or when `limit` hits are found. Folder markers
+  (keys ending in `/`) are skipped and not counted. Paging follows the usual rule: a repeated
+  continuation token is an error, never a silent stop. Stopping before the end of the listing is
+  `truncated: true` with a `reason`; the frontend never presents a truncated result as complete.
+- **Tags.** Tags are not in the listing, so a query with tag terms narrows by its word, phrase,
+  exclusion and path terms first, then calls `GetObjectTagging` for each remaining candidate, 16 in
+  flight, in key order, capped at **2,000 lookups** per search (then `truncated`, reason names the tag
+  cap). Candidates that fail the tag check are not hits. `NoSuchKey` on a lookup (deleted meanwhile)
+  drops the candidate; any other error fails the search. `AccessDenied` on the first lookup fails the
+  search with a message that says tag search needs `s3:GetObjectTagging`.
+- **Cancellation.** The scan checks for cancellation between pages and between tag lookups.
+  Disconnecting cancels running searches.
+- Read-only: `ListObjectsV2`, `HeadObject` and `GetObjectTagging` (all permissions earlier versions already need).
+- Shared buckets (added by name) search the same way.
+
+Frontend:
+
+- The toolbar box becomes **"Filter · press Enter to search"**: typing still filters the loaded rows
+  instantly (unchanged); **Enter** runs `search_objects` with the box's text, `Ctrl+F` focuses the box,
+  **Esc** clears it (and leaves the results view if open). A segmented control beside the box chooses
+  the scope, **This folder** (default; `scope` = current prefix) or **Whole bucket** (`scope` = `""`);
+  the choice persists per session.
+- Results replace the object table in the main area until dismissed: a header line ("*n* results for
+  *query* in *scope* · scanned *m* objects", with the truncation reason when truncated and a "Searching…"
+  state with a Cancel button while running), a "Back to folder" button, and a **virtualized** flat list.
+  Each row: file icon, the key's name with the matched words/phrases highlighted, the key's folder
+  (dimmed, with the match highlighted too), size, last modified, storage class, and the object's tags as
+  chips when the query had tag terms; the exact-path hit is marked "exact match".
+- Row actions: double-click or Enter **goes to the object** (`revealObject`: opens its folder with it
+  selected); right-click (and the keyboard menu key) opens a `PopupMenu` with Go to object, Download,
+  Copy S3 URI, Copy key. Download reuses the existing download flow (same confirmations and destination
+  picker). Multi-select is not needed in v0.6.0.
+- The hint under the box (shown while it has focus and is empty, dismissable) explains the forms in one
+  line: `word`, `"a phrase"`, `-not`, `tag:key=value`, `folder/part`.
+- Changing bucket or disconnecting closes the results view. Refresh re-runs the same search.
+- The mock implements the same parser and scan over its in-memory buckets, including tag terms and the caps.
+
+### Activity right-click menu
+
+Every row in the Activity panel (transfers, folder transfers, jobs) opens a context menu on right-click
+and on the keyboard menu key (`Shift+F10` / `ContextMenu`) when the row is focused (rows become focusable).
+The existing inline buttons stay. Items, in this order, separated into groups as listed:
+
+- **Download (completed):** Open file · Show in folder — Go to object · Copy key · Copy local path — Remove from list.
+- **Download (queued/running):** Cancel — Go to object · Copy key.
+- **Download (failed/cancelled):** Go to object · Copy key · Copy local path — Remove from list.
+- **Upload (completed):** Go to object · Show in folder (the local source) · Copy key · Copy local path — Remove from list.
+  Running: Cancel — Copy key. Failed/cancelled: Copy key · Copy local path — Remove from list.
+- **Folder download (finished, `doneFiles > 0`):** Open folder · Show in folder — Go to folder (navigate
+  to `prefix`) · Copy local path — Remove from list. Active: Cancel — Go to folder. Nothing done: Go to folder · Copy local path — Remove from list.
+- **Folder upload:** Go to folder · Show in folder · Copy local path — Cancel while active, else Remove from list.
+- **Job:** Go to source (`srcBucket`, the first item's folder) · Go to destination (copy/move only:
+  `destBucket`, the first item's destination folder) — Copy failures (only when `errors` is non-empty:
+  one `key — message` per line) — Cancel while active, else Remove from list.
+- "Go to …" uses `revealObject` for an object and `navigate` for a folder; it is disabled with a tooltip
+  when the row's bucket is not in the current connection's bucket list (a different connection).
+- "Copy …" items use the OS clipboard (`copyText`) and toast on failure, like the lifecycle dialog.
+- "Remove from list" calls the existing `remove_*` command; "Clear finished" stays.
+
+| Command | Args | Returns |
+|---|---|---|
+| `open_local` | `{ path }` | `void`. Opens a local file with the OS default application, or a local directory in the file manager, via the opener plugin's `open_path` on the Rust side (no new webview capability). The backend accepts **only** a path that is the `localPath` of a `completed` download transfer still in the transfer list, or the `localPath` of a download batch that is no longer active and has `doneFiles > 0`. Compared after canonicalizing both sides (case-insensitively on Windows). Anything else is `InvalidInput` ("Not a finished download"). |
+
+- `open_local` refuses to open a file whose extension is one of
+  `exe bat cmd com scr ps1 psm1 msi vbs vbe js jse wsf wsh jar sh command app reg lnk url`
+  (case-insensitive) with `NotSupported` ("… could be run as a program; use Show in folder"). The
+  frontend hides "Open file" for those extensions instead of offering an item that fails.
+- `open_local` never follows the path through a symlink or junction whose target leaves the recorded
+  destination directory: the canonical path must still start with the canonical parent recorded for
+  the transfer (same rule as folder downloads).
+
+### Hidden game (from PR #2): window lock
+
+`lockWindowSize(true)` is called when the start-screen game begins and must be undone on **every** exit:
+Esc/game over (already), and the start screen unmounting while the game is open (connecting from a saved
+connection that auto-connects, the window being closed). Implement as an unmount effect in
+`TransferBackdrop` that unlocks when `playing` is true.
+
+### IAM permissions added in this version
+
+None. Search uses `s3:ListBucket`, `s3:GetObject` (HeadObject) and `s3:GetObjectTagging`, which browsing,
+downloading and tag viewing already require.
