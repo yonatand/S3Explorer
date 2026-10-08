@@ -7,6 +7,7 @@ import {
   ACCENT_COLORS,
   TEXT_SETTINGS_LIMITS,
   TRANSFER_SETTINGS_LIMITS,
+  FILE_MANAGER_COMMAND_MAX,
   type AppSettings,
   type TransferKind,
   type TransferSettings, DOWNLOAD_BUFFER_CAP_MIB } from "./types";
@@ -87,7 +88,25 @@ export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
   a.textSize === b.textSize &&
   a.textWeight === b.textWeight &&
   a.accent === b.accent &&
-  a.confirmCopyMove === b.confirmCopyMove;
+  a.confirmCopyMove === b.confirmCopyMove &&
+  (a.fileManagerCommand ?? null) === (b.fileManagerCommand ?? null);
+
+/** The file-manager command as the backend stores it: trimmed, empty becomes null. */
+export function normalizeFileManagerCommand(v: string | null | undefined): string | null {
+  const t = (v ?? "").trim();
+  return t === "" ? null : t;
+}
+
+/** Validation message for a (normalized) file-manager command, or null when it is acceptable. */
+/** Control characters are C0, DEL and C1, as Rust's `char::is_control`. */
+export function validateFileManagerCommand(v: string | null): string | null {
+  if (v === null) return null;
+  if (typeof v !== "string") return "Must be text.";
+  if ([...v].length > FILE_MANAGER_COMMAND_MAX) return `At most ${FILE_MANAGER_COMMAND_MAX.toLocaleString("en-US")} characters.`;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(v)) return "Must be one line, without control characters.";
+  return null;
+}
 
 /** Like `validateSettings`, checking every field of the settings object. */
 export function validateAppSettings(s: AppSettings): { field: keyof AppSettings; message: string } | null {
@@ -106,5 +125,7 @@ export function validateAppSettings(s: AppSettings): { field: keyof AppSettings;
   }
   if (!ACCENT_COLORS.includes(s.accent)) return { field: "accent", message: `Must be one of ${ACCENT_COLORS.join(", ")}.` };
   if (typeof s.confirmCopyMove !== "boolean") return { field: "confirmCopyMove", message: "Must be true or false." };
+  const fm = validateFileManagerCommand(s.fileManagerCommand ?? null);
+  if (fm) return { field: "fileManagerCommand", message: fm };
   return null;
 }

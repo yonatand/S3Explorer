@@ -10,7 +10,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, LogicalSize, type PhysicalSize } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   BATCH_PROGRESS_EVENT,
   JOB_PROGRESS_EVENT,
@@ -39,6 +39,8 @@ import {
   type RecentListing,
   type RestoreRequest,
   type SaveConnectionInput,
+  type SearchQuery,
+  type SearchResult,
   type SavedConnection,
   type Tag,
   type Transfer,
@@ -86,6 +88,13 @@ export interface Backend {
   validateLifecycle(config: LifecycleConfiguration): Promise<LifecycleIssue[]>;
   putLifecycle(bucket: string, config: LifecycleConfiguration, expected: LifecycleConfiguration | null): Promise<LifecycleConfiguration | null>;
   getBucketVersioning(bucket: string): Promise<BucketVersioning>;
+  // Search (v0.6.0)
+  /** A newer search with the same `searchId` cancels the one still running (it rejects `Cancelled`). */
+  searchObjects(query: SearchQuery, searchId: string): Promise<SearchResult>;
+  /** Stop the running search with this id (it rejects `Cancelled`); no-op when none runs. */
+  cancelSearch(searchId: string): Promise<void>;
+  /** Open a finished download (file or folder) with the OS. */
+  openLocal(path: string): Promise<void>;
   // Object operations (jobs)
   previewJob(request: JobRequest): Promise<JobPreview>;
   startJob(request: JobRequest): Promise<string>;
@@ -140,11 +149,23 @@ export interface Backend {
   /** Choose a local folder to upload. */
   pickFolder(): Promise<string | null>;
   joinPath(dir: string, name: string): Promise<string>;
+  /** Show the item in the file manager (the system one, or the program set in Settings). */
   revealInFolder(path: string): Promise<void>;
+  /** Like revealInFolder, but with an unsaved file-manager command (null = the system file manager). */
+  tryFileManager(command: string | null, path: string): Promise<void>;
+  /** Choose a program (the file-manager command's Browse…); null when cancelled. */
+  pickProgram(): Promise<string | null>;
   onFileDrop(cb: (e: FileDropEvent) => void): Promise<Unlisten>;
 }
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/** The OS the webview runs on, from the browser's own report (the one place this is decided). */
+export const clientOS: "windows" | "mac" | "other" = (() => {
+  if (typeof navigator === "undefined") return "other";
+  const p = `${navigator.platform} ${navigator.userAgent}`;
+  return /win/i.test(navigator.platform) || /windows/i.test(p) ? "windows" : /mac/i.test(p) ? "mac" : "other";
+})();
 
 const ERROR_CODES: readonly string[] = [
   "NotConnected", "Auth", "NoSuchBucket", "NoSuchKey", "AccessDenied",
@@ -190,6 +211,9 @@ const tauriBackend: Backend = {
   validateLifecycle: (config) => invoke<LifecycleIssue[]>("validate_lifecycle", { config }),
   putLifecycle: (bucket, config, expected) => invoke<LifecycleConfiguration | null>("put_lifecycle", { bucket, config, expected }),
   getBucketVersioning: (bucket) => invoke<BucketVersioning>("get_bucket_versioning", { bucket }),
+  searchObjects: (query, searchId) => invoke<SearchResult>("search_objects", { query, searchId }),
+  cancelSearch: (searchId) => invoke<void>("cancel_search", { searchId }),
+  openLocal: (path) => invoke<void>("open_local", { path }),
   previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
   startJob: (request) => invoke<string>("start_job", { request }),
   cancelJob: (id) => invoke<void>("cancel_job", { id }),
@@ -270,7 +294,18 @@ const tauriBackend: Backend = {
     return typeof res === "string" ? res : null;
   },
   joinPath: (dir, name) => join(dir, name),
-  revealInFolder: (path) => revealItemInDir(path),
+  revealInFolder: (path) => invoke<void>("reveal_local", { path }),
+  tryFileManager: (command, path) => invoke<void>("try_file_manager", { command, path }),
+  async pickProgram() {
+    // Windows: .exe/.com only (a .bat/.cmd would run through cmd.exe).
+    const res = await open({
+      multiple: false,
+      directory: false,
+      title: "Choose a file manager",
+      ...(clientOS === "windows" ? { filters: [{ name: "Programs", extensions: ["exe", "com"] }] } : {}),
+    });
+    return typeof res === "string" ? res : null;
+  },
   onFileDrop: (cb) =>
     getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload;
@@ -349,6 +384,19 @@ export const validateLifecycle = (config: LifecycleConfiguration) => call("valid
 export const putLifecycle = (bucket: string, config: LifecycleConfiguration, expected: LifecycleConfiguration | null) =>
   call("putLifecycle", bucket, config, expected);
 export const getBucketVersioning = (bucket: string) => call("getBucketVersioning", bucket);
+/**
+ * Search the bucket by a bounded scan of its keys (see "Search in a bucket" in docs/CONTRACT.md).
+ * A newer call with the same `searchId` cancels this one, which then rejects with `Cancelled`.
+ */
+export const searchObjects = (query: SearchQuery, searchId: string) => call("searchObjects", query, searchId);
+/** Stop the running search with this id; it then rejects with `Cancelled`. No-op when none runs. */
+export const cancelSearch = (searchId: string) => call("cancelSearch", searchId);
+/**
+ * Open a finished download with the OS default application (a file) or the file manager (a
+ * folder). The backend accepts only the local path of a completed download or finished folder
+ * download; it refuses files that could run as a program (`NotSupported`).
+ */
+export const openLocal = (path: string) => call("openLocal", path);
 export const previewJob = (request: JobRequest) => call("previewJob", request);
 export const startJob = (request: JobRequest) => call("startJob", request);
 export const cancelJob = (id: string) => call("cancelJob", id);
@@ -437,5 +485,10 @@ export const pickSavePath = (defaultName: string) => call("pickSavePath", defaul
 export const pickDirectory = () => call("pickDirectory");
 export const pickFolder = () => call("pickFolder");
 export const joinPath = (dir: string, name: string) => call("joinPath", dir, name);
+/** Show the item in the file manager: the system one, or the program set in Settings (`reveal_local`). */
 export const revealInFolder = (path: string) => call("revealInFolder", path);
+/** Test a file-manager command before saving it (`try_file_manager`); null = the system file manager. */
+export const tryFileManager = (command: string | null, path: string) => call("tryFileManager", command, path);
+/** The file picker for the file-manager command's Browse… button. */
+export const pickProgram = () => call("pickProgram");
 export const onFileDrop = (cb: (e: FileDropEvent) => void) => call("onFileDrop", cb);

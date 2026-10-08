@@ -31,7 +31,9 @@ import {
   GIB,
   MIB,
   planParts,
+  normalizeFileManagerCommand,
   sameAppSettings,
+  validateFileManagerCommand,
   validateInteger,
   worstCasePartMib,
 } from "../lib/settings";
@@ -49,7 +51,7 @@ import {
 import { toast } from "../store/toasts";
 import { useUpdates } from "../store/updates";
 import { AppearanceTab } from "./AppearanceTab";
-import { BehaviorTab } from "./BehaviorTab";
+import { BehaviorTab, type FileManagerDraft } from "./BehaviorTab";
 import { NotificationsTab } from "./NotificationsTab";
 import { UpdatesTab } from "./UpdatesTab";
 
@@ -75,6 +77,7 @@ interface Draft {
   textWeight: number;
   accent: AccentColor;
   confirmCopyMove: boolean;
+  fileManager: FileManagerDraft;
 }
 
 type TransferErrors = Record<"partSize" | "parts" | "transfers", string | null>;
@@ -93,7 +96,15 @@ const toDraft = (s: AppSettings): Draft => ({
   textWeight: s.textWeight,
   accent: s.accent,
   confirmCopyMove: s.confirmCopyMove,
+  fileManager: { mode: s.fileManagerCommand ? "program" : "system", command: s.fileManagerCommand ?? "" },
 });
+
+/** Problem with the file-manager choice, or null. "This program" needs a command. */
+function fileManagerError(f: FileManagerDraft): string | null {
+  if (f.mode === "system") return null;
+  const cmd = normalizeFileManagerCommand(f.command);
+  return cmd === null ? "Enter a command, or choose System file manager." : validateFileManagerCommand(cmd);
+}
 
 function transferErrors(d: TransferDraft): TransferErrors {
   return {
@@ -108,6 +119,7 @@ function toSettings(d: Draft): AppSettings | null {
   const t = d.transfers;
   const errs = transferErrors(t);
   if (errs.partSize || errs.parts || errs.transfers) return null;
+  if (fileManagerError(d.fileManager)) return null;
   return {
     partSizeMib: t.partMode === "auto" ? null : Number(t.partSize),
     maxConcurrentParts: Number(t.parts),
@@ -119,6 +131,7 @@ function toSettings(d: Draft): AppSettings | null {
     textWeight: d.textWeight,
     accent: d.accent,
     confirmCopyMove: d.confirmCopyMove,
+    fileManagerCommand: d.fileManager.mode === "system" ? null : normalizeFileManagerCommand(d.fileManager.command),
   };
 }
 
@@ -138,6 +151,8 @@ interface TabContext {
   draft: Draft;
   update(next: Draft): void;
   disabled: boolean;
+  /** The last save's error (the backend's message), for a tab to show under its field. */
+  saveError: AppError | null;
 }
 
 interface SettingsTab {
@@ -174,12 +189,18 @@ const TABS: SettingsTab[] = [
     render: (ctx) => (
       <BehaviorTab
         confirmCopyMove={ctx.draft.confirmCopyMove}
+        fileManager={ctx.draft.fileManager}
+        fileManagerError={
+          fileManagerError(ctx.draft.fileManager) ??
+          (ctx.saveError && /filemanager|file manager|command/i.test(ctx.saveError.message) ? ctx.saveError.message : null)
+        }
         disabled={ctx.disabled}
         onConfirmCopyMoveChange={(confirmCopyMove) => ctx.update({ ...ctx.draft, confirmCopyMove })}
+        onFileManagerChange={(fileManager) => ctx.update({ ...ctx.draft, fileManager })}
       />
     ),
-    reset: (d) => ({ ...d, confirmCopyMove: DEFAULT_DRAFT.confirmCopyMove }),
-    atDefaults: (d) => d.confirmCopyMove === DEFAULT_DRAFT.confirmCopyMove,
+    reset: (d) => ({ ...d, confirmCopyMove: DEFAULT_DRAFT.confirmCopyMove, fileManager: DEFAULT_DRAFT.fileManager }),
+    atDefaults: (d) => d.confirmCopyMove === DEFAULT_DRAFT.confirmCopyMove && d.fileManager.mode === "system",
   },
   {
     id: "appearance",
@@ -738,7 +759,7 @@ function SettingsDialogInner() {
             >
               <h3 className="settings-panel-title">{current.label}</h3>
               {ready ? (
-                current.render({ draft: draft!, update, disabled: saving })
+                current.render({ draft: draft!, update, disabled: saving, saveError })
               ) : loadError ? (
                 <div className="settings-state">
                   <div className="form-error">

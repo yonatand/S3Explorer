@@ -1,4 +1,5 @@
-import { memo, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { create } from "zustand";
 import {
   AlertTriangle,
   ArrowDownToLine,
@@ -20,15 +21,21 @@ import {
   ArchiveRestore,
   FolderDown,
   FolderUp,
+  ClipboardCopy,
+  ExternalLink,
+  LocateFixed,
 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, Batch, BatchStatus, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
 import { isActive, selectActiveCount, useTransfers } from "../store/transfers";
-import { removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
+import { jobRequest, removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
 import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, useBatches } from "../store/batches";
-import { setTransfersOpen, useApp } from "../store/app";
+import { navigate, revealObject, setTransfersOpen, useApp } from "../store/app";
+import { closeSearch } from "../store/search";
+import { copyText } from "../store/actions";
+import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
 import { toast } from "../store/toasts";
-import { basename, formatBytes, formatDuration, formatSpeed } from "../lib/format";
+import { basename, formatBytes, formatDuration, formatSpeed, refusedToOpen } from "../lib/format";
 import { isJobActive, jobFraction, plural } from "../lib/ops";
 import { shortVersionId, useVersionDownloads } from "../store/versions";
 
@@ -100,7 +107,7 @@ const TransferRow = memo(function TransferRow({ id }: { id: string }) {
       ? `s3://${t.bucket}/${t.key}${versionId ? ` (version ${versionId})` : ""} → ${t.localPath}`
       : `${t.localPath} → s3://${t.bucket}/${t.key}`;
   return (
-    <div className={`xrow status-${t.status}`}>
+    <div className={`xrow status-${t.status}`} {...menuProps("transfer", id)}>
       <div className={`xdir ${t.kind}`} title={t.kind === "download" ? "Download" : "Upload"}>
         <DirIcon size={14} />
       </div>
@@ -196,7 +203,7 @@ const JobRow = memo(function JobRow({ id }: { id: string }) {
         : STATUS_LABEL[j.status];
   return (
     <div id={`job-${id}`} className={`jobwrap ${hasProblems ? "has-problems" : ""}`}>
-      <div className={`xrow jrow status-${j.status}`}>
+      <div className={`xrow jrow status-${j.status}`} {...menuProps("job", id)}>
         <div className={`xdir job-${j.kind}`} title={JOB_KIND_LABEL[j.kind]}>
           <Icon size={14} />
         </div>
@@ -342,7 +349,7 @@ const BatchRow = memo(function BatchRow({ id }: { id: string }) {
   const where = batchWhere(b);
   return (
     <div id={`batch-${id}`} className={`jobwrap batchwrap ${hasProblems ? "has-problems" : ""}`}>
-      <div className={`xrow jrow brow status-${b.status}`}>
+      <div className={`xrow jrow brow status-${b.status}`} {...menuProps("batch", id)}>
         <div className={`xdir ${b.kind}`} title={b.kind === "upload" ? "Folder upload" : "Folder download"}>
           <Icon size={14} />
         </div>
@@ -424,6 +431,212 @@ const BatchRow = memo(function BatchRow({ id }: { id: string }) {
     </div>
   );
 });
+
+// ---- right-click menu (v0.6.0) -----------------------------------------------------------------
+
+type MenuTarget = { kind: "transfer" | "batch" | "job"; id: string; x: number; y: number; el: HTMLElement | null };
+
+/** The one open Activity menu (rows only set it; the panel renders it). */
+const useActivityMenu = create<{ menu: MenuTarget | null }>(() => ({ menu: null }));
+
+/** Row props that open the menu on right-click and on the keyboard menu key (ContextMenu, Shift+F10). */
+function menuProps(kind: MenuTarget["kind"], id: string) {
+  return {
+    tabIndex: 0,
+    onContextMenu: (e: ReactMouseEvent<HTMLElement>) => {
+      e.preventDefault();
+      useActivityMenu.setState({ menu: { kind, id, x: e.clientX, y: e.clientY, el: e.currentTarget } });
+    },
+    onKeyDown: (e: ReactKeyboardEvent<HTMLElement>) => {
+      if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+      e.preventDefault();
+      const el = e.currentTarget;
+      const r = el.getBoundingClientRect();
+      useActivityMenu.setState({ menu: { kind, id, x: r.left + 40, y: r.bottom - 6, el } });
+    },
+  };
+}
+
+/** The folder that holds a key or prefix: "a/b/c.txt" -> "a/b/", "a/b/" -> "a/", "a//" -> "a/". */
+function folderOf(keyOrPrefix: string): string {
+  const body = keyOrPrefix.endsWith("/") ? keyOrPrefix.slice(0, -1) : keyOrPrefix;
+  return body.slice(0, body.lastIndexOf("/") + 1);
+}
+
+type KnownBucket = (bucket: string | null | undefined) => boolean;
+
+/** Is `bucket` one of the current connection's buckets (listed or added by name)? */
+function useKnownBucket(): KnownBucket {
+  const connected = useApp((s) => !!s.connection);
+  const buckets = useApp((s) => s.buckets);
+  const added = useApp((s) => s.addedBuckets);
+  return useCallback(
+    (bucket) => !!bucket && connected && (buckets.some((b) => b.name === bucket) || added.some((b) => b.name === bucket)),
+    [connected, buckets, added],
+  );
+}
+
+async function openLocal(path: string, what: string) {
+  try {
+    await api.openLocal(path);
+  } catch (e) {
+    toast.error(`Could not open ${what}`, e as AppError);
+  }
+}
+
+/** "Go to …": disabled, with the reason, when the bucket is not in this connection. */
+function goItem(label: string, bucket: string, known: boolean, go: () => void): PopupMenuItem {
+  return known
+    ? { label, icon: <LocateFixed size={14} />, action: go }
+    : {
+        label,
+        icon: <LocateFixed size={14} />,
+        action: () => {},
+        disabled: true,
+        hint: "Other connection",
+        title: `s3://${bucket} is not one of this connection's buckets`,
+      };
+}
+
+const goObject = (bucket: string, key: string) => {
+  closeSearch();
+  revealObject(bucket, key, key.slice(key.lastIndexOf("/") + 1));
+};
+const goFolder = (bucket: string, prefix: string) => {
+  closeSearch();
+  navigate(bucket, prefix);
+};
+
+const copyKeyItem = (key: string): PopupMenuItem => ({ label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(key, "Key") });
+const copyPathItem = (path: string): PopupMenuItem => ({
+  label: "Copy local path",
+  icon: <ClipboardCopy size={14} />,
+  action: () => void copyText(path, "Local path"),
+});
+const showItem = (path: string): PopupMenuItem => ({ label: "Show in folder", icon: <FolderSearch size={14} />, action: () => void reveal({ localPath: path }) });
+const cancelItem = (run: () => void): PopupMenuItem => ({ label: "Cancel", icon: <CircleStop size={14} />, action: run });
+/**
+ * "Remove from list" takes the row away: keep the keyboard focus in the panel by moving it to the
+ * next row, else the previous one, else the panel's toggle.
+ */
+const removeItem = (el: HTMLElement | null, run: () => Promise<void>): PopupMenuItem => ({
+  label: "Remove from list",
+  icon: <X size={14} />,
+  action: () => {
+    const rows = [...document.querySelectorAll<HTMLElement>(".transfers-body .xrow[tabindex]")];
+    const i = el ? rows.indexOf(el) : -1;
+    const next = i >= 0 ? (rows[i + 1] ?? rows[i - 1] ?? null) : null;
+    // After the removal has rendered (a frame later), unless the backend kept the row.
+    void run().finally(() =>
+      requestAnimationFrame(() => {
+        if (el?.isConnected) return;
+        const target = next?.isConnected ? next : document.querySelector<HTMLElement>(".transfers-toggle");
+        target?.focus();
+      }),
+    );
+  },
+});
+
+function transferGroups(t: Transfer, known: boolean, el: HTMLElement | null): PopupMenuItem[][] {
+  const go = goItem("Go to object", t.bucket, known, () => goObject(t.bucket, t.key));
+  const remove = removeItem(el, () => removeTransfers([t.id]));
+  if (isActive(t)) {
+    const stop = cancelItem(() => void cancel(t.id));
+    return t.kind === "download" ? [[stop], [go, copyKeyItem(t.key)]] : [[stop], [copyKeyItem(t.key)]];
+  }
+  if (t.kind === "download") {
+    if (t.status === "completed") {
+      const open: PopupMenuItem[] = refusedToOpen(t.localPath)
+        ? []
+        : [{ label: "Open file", icon: <ExternalLink size={14} />, action: () => void openLocal(t.localPath, "the file") }];
+      return [[...open, showItem(t.localPath)], [go, copyKeyItem(t.key), copyPathItem(t.localPath)], [remove]];
+    }
+    return [[go, copyKeyItem(t.key), copyPathItem(t.localPath)], [remove]];
+  }
+  if (t.status === "completed") return [[go, showItem(t.localPath), copyKeyItem(t.key), copyPathItem(t.localPath)], [remove]];
+  return [[copyKeyItem(t.key), copyPathItem(t.localPath)], [remove]];
+}
+
+function batchGroups(b: Batch, known: boolean, el: HTMLElement | null): PopupMenuItem[][] {
+  const go = goItem("Go to folder", b.bucket, known, () => goFolder(b.bucket, b.prefix));
+  const active = isBatchActive(b);
+  const stop = cancelItem(() => void cancelBatch(b.id));
+  const remove = removeItem(el, () => removeBatches([b.id]));
+  if (b.kind === "upload") return [[go, showItem(b.localPath), copyPathItem(b.localPath)], [active ? stop : remove]];
+  if (active) return [[stop], [go]];
+  if (b.doneFiles > 0) {
+    const open: PopupMenuItem[] = refusedToOpen(b.localPath)
+      ? []
+      : [{ label: "Open folder", icon: <ExternalLink size={14} />, action: () => void openLocal(b.localPath, "the folder") }];
+    return [
+      [...open, showItem(b.localPath)],
+      [go, copyPathItem(b.localPath)],
+      [remove],
+    ];
+  }
+  return [[go, copyPathItem(b.localPath)], [remove]];
+}
+
+function jobGroups(j: Job, known: KnownBucket, el: HTMLElement | null): PopupMenuItem[][] {
+  // Jobs carry no item list; the request they were started with does (this session only).
+  const first = jobRequest(j.id)?.items[0];
+  const go: PopupMenuItem[] = [goItem("Go to source", j.srcBucket, known(j.srcBucket), () => goFolder(j.srcBucket, first ? folderOf(first.from) : ""))];
+  if ((j.kind === "copy" || j.kind === "move") && j.destBucket) {
+    const dest = j.destBucket;
+    go.push(goItem("Go to destination", dest, known(dest), () => goFolder(dest, first?.to ? folderOf(first.to) : "")));
+  }
+  const failures: PopupMenuItem[] = j.errors.length
+    ? [
+        {
+          label: "Copy failures",
+          icon: <ClipboardCopy size={14} />,
+          action: () =>
+            void copyText(j.errors.map((e) => `${e.key} — ${e.message}`).join("\n"), j.errors.length === 1 ? "Failure" : `${j.errors.length} failures`),
+        },
+      ]
+    : [];
+  return [go, failures, [isJobActive(j) ? cancelItem(() => void cancelJob(j.id)) : removeItem(el, () => removeJobs([j.id]))]];
+}
+
+/** The open menu. Items follow the row's status, but byte counters (10 Hz) do not re-render it. */
+function ActivityMenu() {
+  const menu = useActivityMenu((s) => s.menu);
+  const known = useKnownBucket();
+  const tSig = useTransfers((s) => (menu?.kind === "transfer" ? s.byId[menu.id]?.status : undefined));
+  const bSig = useBatches((s) => {
+    const b = menu?.kind === "batch" ? s.byId[menu.id] : undefined;
+    return b ? `${b.status}|${b.doneFiles > 0}` : undefined;
+  });
+  const jSig = useJobs((s) => {
+    const j = menu?.kind === "job" ? s.byId[menu.id] : undefined;
+    return j ? `${j.status}|${j.errors.length}` : undefined;
+  });
+  const groups = useMemo(() => {
+    if (!menu) return null;
+    if (menu.kind === "transfer") {
+      const t = useTransfers.getState().byId[menu.id];
+      return t ? transferGroups(t, known(t.bucket), menu.el) : null;
+    }
+    if (menu.kind === "batch") {
+      const b = useBatches.getState().byId[menu.id];
+      return b ? batchGroups(b, known(b.bucket), menu.el) : null;
+    }
+    const j = useJobs.getState().byId[menu.id];
+    return j ? jobGroups(j, known, menu.el) : null;
+    // The signatures stand for the row state the items depend on.
+  }, [menu, known, tSig, bSig, jSig]);
+  const close = useCallback(() => {
+    const el = useActivityMenu.getState().menu?.el;
+    useActivityMenu.setState({ menu: null });
+    if (el?.isConnected) el.focus();
+  }, []);
+  // The row went away (removed from the list): close.
+  useEffect(() => {
+    if (menu && !groups) useActivityMenu.setState({ menu: null });
+  }, [menu, groups]);
+  if (!menu || !groups) return null;
+  return <PopupMenu x={menu.x} y={menu.y} groups={groups} onClose={close} label="Activity item" />;
+}
 
 /** Overall progress of everything active: each transfer, job or folder transfer weighs the same. */
 function Summary() {
@@ -563,6 +776,7 @@ export function ActivityPanel() {
           )}
         </div>
       )}
+      <ActivityMenu />
     </section>
   );
 }

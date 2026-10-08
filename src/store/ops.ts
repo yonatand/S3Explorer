@@ -11,7 +11,7 @@ import { jobRequest, onJobUpdate, rememberJobRequest, useJobs } from "./jobs";
 import { notifyInBackground } from "./notify";
 import { useSettings } from "./settings";
 import { toast, toastFailure } from "./toasts";
-import { getSelected } from "./view";
+import { getSelected, getSelectionPrefix } from "./view";
 import { ARCHIVED_MESSAGE, isArchiveClass, splitReadable, toastArchivedSkipped } from "./archive";
 
 /** The current selection as clip items (exact keys/prefixes), folders first. */
@@ -55,7 +55,8 @@ export function requestDelete() {
 
 /** Edit the tags of the selection: one object opens its tag editor; anything else a bulk tag job. */
 export function requestBulkTags() {
-  const { bucket, prefix } = useApp.getState();
+  const { bucket } = useApp.getState();
+  const prefix = getSelectionPrefix();
   const items = selectedItems();
   if (!bucket || !items.length) return;
   if (tooMany(items.length, "tag")) return;
@@ -76,7 +77,8 @@ export function requestBulkTags() {
  * Returns null when nothing is left.
  */
 export async function withoutArchived(bucket: string, items: ClipItem[], action: string): Promise<ClipItem[] | null> {
-  const listed = new Map(useApp.getState().listing.objects.map((o) => [o.key, o]));
+  // The storage class as listed: the open folder's rows, or the selected search hits.
+  const listed = new Map([...useApp.getState().listing.objects, ...getSelected().objects].map((o) => [o.key, o]));
   const objects = items.filter((i) => !i.isPrefix).map((i) => ({ key: i.key, storageClass: listed.get(i.key)?.storageClass ?? null }));
   const { blocked } = await splitReadable(bucket, objects);
   if (!blocked.length) return items;
@@ -95,7 +97,8 @@ export async function withoutArchived(bucket: string, items: ClipItem[], action:
  * anything else (several, or folders) a "restore" job over the selected folders and archived objects.
  */
 export function requestRestoreArchived() {
-  const { bucket, prefix } = useApp.getState();
+  const { bucket } = useApp.getState();
+  const prefix = getSelectionPrefix();
   const { folders, objects } = getSelected();
   if (!bucket) return;
   const archived = objects.filter((o) => isArchiveClass(o.storageClass));
@@ -138,7 +141,9 @@ export async function requestRename() {
 // ---- clipboard ------------------------------------------------------------------------------
 
 export async function copySelection(mode: "copy" | "cut") {
-  const { bucket, prefix } = useApp.getState();
+  const { bucket } = useApp.getState();
+  // Search results can come from several folders: the clipboard names the folder they share.
+  const prefix = getSelectionPrefix();
   const selected = selectedItems();
   if (!bucket || !selected.length) return;
   if (tooMany(selected.length, mode === "copy" ? "copy" : "move")) return;
@@ -190,6 +195,21 @@ export function buildTransferRequest(
         // `taken` is only passed by paste, which keeps its own wording.
         title: `Can’t ${dest.taken ? "paste" : src.mode === "cut" ? "move" : "copy"} a folder into itself`,
         detail: `“${into.key}” would be ${src.mode === "cut" ? "moved" : "copied"} into ${dest.prefix === into.key ? "itself" : `its own subfolder “${dest.prefix}”`}.`,
+      };
+    }
+  }
+  // Items picked from search results can come from several folders. When only some of them are
+  // already in the destination, a copy would duplicate those and a move would be a no-op on
+  // them: refuse instead of guessing.
+  if (sameBucket) {
+    const parentOf = (i: ClipItem) => i.key.slice(0, i.key.length - i.name.length - (i.isPrefix ? 1 : 0));
+    const here = src.items.filter((i) => parentOf(i) === dest.prefix).length;
+    if (here > 0 && here < src.items.length) {
+      return {
+        ok: false,
+        info: true,
+        title: "Some items are already in this folder",
+        detail: `${plural(here, "item")} of ${src.items.length} are already in “${dest.prefix || "the top of the bucket"}”. Copy or cut only the others.`,
       };
     }
   }

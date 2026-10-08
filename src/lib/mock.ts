@@ -30,19 +30,23 @@ import type {
   RestoreRequest,
   SaveConnectionInput,
   SavedConnection,
+  SearchHit,
+  SearchQuery,
+  SearchResult,
   Tag,
   Transfer,
   UpdateInfo,
   UpdateProgress,
   VersionListing,
 } from "./types";
-import { BATCH_LIMITS, RESTORE_DAYS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
-import { planParts, validateAppSettings } from "./settings";
+import { BATCH_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
 import { validateLifecycleConfig } from "./lifecycleCheck";
 import { sameConfiguration } from "./lifecycle";
 import { sanitizeFileName } from "./format";
+import { matchesTags, matchesText, parseSearch } from "./search";
 
 // ---- deterministic randomness ----------------------------------------------
 
@@ -1976,6 +1980,252 @@ function jobTick() {
 
 // ---- the backend ---------------------------------------------------------------------
 
+// ---- v0.6.0: search ----------------------------------------------------------------------
+
+/** Caps, overridable from a test driver (`__s3xMock.setSearchCaps`) to exercise truncation. */
+const searchCaps: { maxScan: number; maxTagLookups: number } = { maxScan: SEARCH_LIMITS.maxScan, maxTagLookups: SEARCH_LIMITS.maxTagLookups };
+/** The newest search per searchId; an older one sees it changed and stops with Cancelled. */
+const searchGen = new Map<string, number>();
+let searchSeq = 0;
+/** Bumped by disconnect: every running search stops. */
+let searchEpoch = 0;
+const searchCallLog: { query: SearchQuery; searchId: string; at: string }[] = [];
+const openLocalCallLog: { path: string; at: string }[] = [];
+const cancelSearchCallLog: { searchId: string; at: string }[] = [];
+const revealCallLog: { command: string | null; path: string; at: string }[] = [];
+const tryFileManagerCallLog: { command: string | null; path: string; at: string }[] = [];
+
+/** The program of a file-manager command: the first argument (double quotes group, `\"` is a literal quote). */
+function commandProgram(cmd: string): string {
+  let out = "";
+  let inQuote = false;
+  let i = 0;
+  while (i < cmd.length && /\s/.test(cmd[i])) i++;
+  for (; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (c === "\\" && cmd[i + 1] === '"') {
+      out += '"';
+      i++;
+    } else if (c === '"') inQuote = !inQuote;
+    else if (!inQuote && /\s/.test(c)) break;
+    else out += c;
+  }
+  return out;
+}
+
+const SHELLS = new Set(["cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "sh", "bash", "zsh", "fish"]);
+
+/**
+ * Mock spawn, mirroring the backend's checks: shells and script hosts are refused; a bare name is
+ * "found on PATH"; a path must be absolute; a program whose name contains "missing" does not exist.
+ */
+function mockSpawnFileManager(cmd: string, path: string) {
+  if (!isAbsoluteLocal(path)) throw fail("InvalidInput", "The path must be absolute.");
+  const program = commandProgram(cmd);
+  const name = program.split(/[\\/]/).pop()!.toLowerCase().replace(/\.exe$/, "");
+  if (SHELLS.has(name)) throw fail("InvalidInput", `${program} is a shell, not a file manager`);
+  const bare = !/[\\/]/.test(program);
+  if (!program || /missing/i.test(program) || (!bare && !isAbsoluteLocal(program))) {
+    throw fail("InvalidInput", `File manager not found: ${program || cmd}`);
+  }
+}
+/** Keys "listed" per simulated page, and how long a page takes. */
+const SEARCH_PAGE = 1000;
+const SEARCH_PAGE_MS = 25;
+
+const entryOf = (key: string, o: MockObject): ObjectEntry => ({
+  key,
+  name: key.slice(key.lastIndexOf("/") + 1),
+  size: o.size,
+  lastModified: o.lastModified,
+  etag: o.etag,
+  storageClass: o.storageClass,
+});
+
+/** A folder entry for a prefix ending in "/": its name is the last segment (may be empty, "a//"). */
+function folderEntryOf(prefix: string): FolderEntry {
+  const body = prefix.slice(0, -1);
+  return { prefix, name: body.slice(body.lastIndexOf("/") + 1) };
+}
+
+async function mockSearch(query: SearchQuery, searchId: string): Promise<SearchResult> {
+  searchCallLog.push({ query: { ...query }, searchId, at: new Date().toISOString() });
+  const gen = ++searchSeq;
+  searchGen.set(searchId, gen);
+  const epoch = searchEpoch;
+  const cancelled = () => searchGen.get(searchId) !== gen || searchEpoch !== epoch;
+  const stop = () => fail("Cancelled", "The search was cancelled.");
+
+  await delay(60);
+  if (cancelled()) throw stop();
+  const b = requireBucket(query.bucket);
+  if (!Number.isInteger(query.limit) || query.limit < SEARCH_LIMITS.hits.min || query.limit > SEARCH_LIMITS.hits.max) {
+    throw fail("InvalidInput", `limit must be between ${SEARCH_LIMITS.hits.min} and ${SEARCH_LIMITS.hits.max}.`);
+  }
+  const parsed = parseSearch(query.text, query.scope);
+  if (!parsed) throw fail("InvalidInput", "Type something to search for.");
+  const wantTags = parsed.tags.length > 0;
+  if (wantTags && tagsUnsupported(query.bucket)) throw notSupported();
+
+  const keys = sortedKeys(b);
+  // Exact hits first, then folders (prefix order), then objects (key order); all count toward `limit`.
+  const exactHits: SearchHit[] = [];
+  const folderHits = new Map<string, SearchHit>();
+  const objectHits: SearchHit[] = [];
+  const total = () => exactHits.length + folderHits.size + objectHits.length;
+  let exactKey: string | null = null;
+  let exactFolder: string | null = null;
+  if (parsed.exactPath !== null) {
+    if (!parsed.exactPath.endsWith("/")) {
+      // HeadObject on the key exactly as typed (it may be outside the scope); a miss is not an error.
+      const o = b.objects.get(parsed.exactPath);
+      if (o) {
+        exactKey = parsed.exactPath;
+        exactHits.push({ kind: "object", entry: entryOf(exactKey, o), folder: null, tags: wantTags ? copyTags(o.tags) : null, exact: true });
+      }
+    }
+    // The term as a folder: ListObjectsV2 prefix = term (+ "/"), max-keys 1. Never skipped for "a/".
+    const fp = parsed.exactPath.endsWith("/") ? parsed.exactPath : parsed.exactPath + "/";
+    const at = lowerBound(keys, fp);
+    if (at < keys.length && keys[at].startsWith(fp)) {
+      exactFolder = fp;
+      exactHits.push({ kind: "folder", entry: null, folder: folderEntryOf(fp), tags: null, exact: true });
+    }
+  }
+  /** Every folder below the listed prefix that this key implies (its ancestors; a marker is its own). */
+  const deriveFolders = (key: string, listPrefix: string) => {
+    if (wantTags) return; // folders have no tags
+    const rest = key.slice(listPrefix.length);
+    for (let j = rest.indexOf("/"); j >= 0; j = rest.indexOf("/", j + 1)) {
+      const prefix = listPrefix + rest.slice(0, j + 1);
+      if (prefix === exactFolder || folderHits.has(prefix) || seenFolders.has(prefix)) continue;
+      if (!matchesText(prefix, parsed)) {
+        seenFolders.add(prefix);
+        continue;
+      }
+      if (total() >= query.limit) {
+        stopAtLimit();
+        return;
+      }
+      seenFolders.add(prefix);
+      folderHits.set(prefix, { kind: "folder", entry: null, folder: folderEntryOf(prefix), tags: null, exact: false });
+    }
+  };
+  const seenFolders = new Set<string>();
+  const stopAtLimit = () => {
+    truncated = true;
+    reason = query.limit === 1 ? "Stopped at 1 result" : `Stopped at ${query.limit.toLocaleString("en-US")} results`;
+  };
+
+  let scanned = 0;
+  let tagLookups = 0;
+  let truncated = false;
+  let reason: string | null = null;
+  const scan = async (listPrefix: string) => {
+    let inPage = 0;
+    for (let i = lowerBound(keys, listPrefix); i < keys.length && keys[i].startsWith(listPrefix); i++) {
+      if (inPage++ >= SEARCH_PAGE) {
+        inPage = 1;
+        await delay(SEARCH_PAGE_MS);
+        if (cancelled()) throw stop();
+      }
+      const key = keys[i];
+      if (truncated) return;
+      if (key.endsWith("/")) {
+        deriveFolders(key, listPrefix); // folder markers are folders, but not counted as scanned
+        continue;
+      }
+      if (total() >= query.limit) {
+        stopAtLimit();
+        return;
+      }
+      if (scanned >= searchCaps.maxScan) {
+        truncated = true;
+        reason = `Stopped after scanning ${searchCaps.maxScan.toLocaleString("en-US")} objects`;
+        return;
+      }
+      scanned++;
+      deriveFolders(key, listPrefix);
+      if (truncated) return;
+      if (key === exactKey || !matchesText(key, parsed)) continue;
+      const o = b.objects.get(key)!;
+      if (wantTags) {
+        if (tagLookups >= searchCaps.maxTagLookups) {
+          truncated = true;
+          reason = `Stopped after ${searchCaps.maxTagLookups.toLocaleString("en-US")} tag lookups`;
+          return;
+        }
+        tagLookups++;
+        if (tagLookups % 16 === 0) {
+          await delay(8);
+          if (cancelled()) throw stop();
+        }
+        const tags = o.tags ?? [];
+        if (!matchesTags(tags, parsed.tags)) continue;
+        objectHits.push({ kind: "object", entry: entryOf(key, o), folder: null, tags: copyTags(tags), exact: false });
+      } else {
+        // The folders this key implied may have filled the limit.
+        if (total() >= query.limit) {
+          stopAtLimit();
+          return;
+        }
+        objectHits.push({ kind: "object", entry: entryOf(key, o), folder: null, tags: null, exact: false });
+      }
+    }
+  };
+  await scan(parsed.listPrefix);
+  // Narrowing fallback: prefixes are case-sensitive, so a narrowed listing that saw no keys at all is
+  // scanned again from the scope, where the path term can still match as a case-insensitive word.
+  if (scanned === 0 && parsed.listPrefix.length > query.scope.length) {
+    parsed.listPrefix = query.scope;
+    folderHits.clear();
+    seenFolders.clear();
+    await scan(query.scope);
+  }
+  await delay(40);
+  if (cancelled()) throw stop();
+  const folders = [...folderHits.values()].sort((x, y) => (x.folder!.prefix < y.folder!.prefix ? -1 : x.folder!.prefix > y.folder!.prefix ? 1 : 0));
+  const hits = [...exactHits, ...folders, ...objectHits];
+  return { hits, scanned, tagLookups, truncated, reason, parsed };
+}
+
+/** `open_local` accepts only a completed download or a finished folder download with files done. */
+function mockOpenLocal(path: string) {
+  openLocalCallLog.push({ path, at: new Date().toISOString() });
+  const norm = (p: string) => p.replace(/[\\/]+$/, "").toLowerCase();
+  const target = norm(path);
+  const fromTransfer = [...sims.values()].some((s) => s.t.kind === "download" && s.t.status === "completed" && norm(s.t.localPath) === target);
+  const fromBatch = [...batchSims.values()].some(
+    (s) => s.b.kind === "download" && !isBatchActive(s.b) && s.b.doneFiles > 0 && norm(s.b.localPath) === target,
+  );
+  if (!fromTransfer && !fromBatch) throw fail("InvalidInput", "Not a finished download.");
+  // Like the backend: trailing dots and spaces are ignored, and folders are checked too (x.app).
+  const name = lastSegment(path).replace(/[. ]+$/, "");
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+  if ((OPEN_LOCAL_REFUSED_EXTENSIONS as readonly string[]).includes(ext)) {
+    throw fail("NotSupported", `“${name}” could be run as a program; use Show in folder.`);
+  }
+  console.info("[mock] open local:", path);
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  searchCalls: searchCallLog,
+  cancelSearchCalls: cancelSearchCallLog,
+  revealCalls: revealCallLog,
+  tryFileManagerCalls: tryFileManagerCallLog,
+  openLocalCalls: openLocalCallLog,
+  /** Cancel every running search behind the UI's back (as the backend would on disconnect). */
+  cancelRunningSearches: () => {
+    for (const id of searchGen.keys()) searchGen.set(id, ++searchSeq);
+  },
+  /** Lower the search caps to see truncation (null restores the contract's values). */
+  setSearchCaps: (caps: { maxScan?: number; maxTagLookups?: number } | null) => {
+    searchCaps.maxScan = caps?.maxScan ?? SEARCH_LIMITS.maxScan;
+    searchCaps.maxTagLookups = caps?.maxTagLookups ?? SEARCH_LIMITS.maxTagLookups;
+  },
+});
+
 export const mockBackend: Backend = {
   async listProfiles() {
     await latency();
@@ -2029,6 +2279,7 @@ export const mockBackend: Backend = {
     }
     connection = null;
     connectionKey = null;
+    searchEpoch++;
   },
 
   async connectionStatus() {
@@ -2194,6 +2445,21 @@ export const mockBackend: Backend = {
     writeLifecycle(bucket, config.rules.length ? asStored(config) : null);
     if (f) throw fail(f.code, f.message);
     return storedLifecycle(bucket);
+  },
+
+  async searchObjects(query, searchId) {
+    return mockSearch(query, searchId);
+  },
+
+  async cancelSearch(searchId) {
+    cancelSearchCallLog.push({ searchId, at: new Date().toISOString() });
+    // The running search with this id sees a newer generation and stops with Cancelled; no-op otherwise.
+    if (searchGen.has(searchId)) searchGen.set(searchId, ++searchSeq);
+  },
+
+  async openLocal(path) {
+    await delay(40);
+    mockOpenLocal(path);
   },
 
   async getBucketVersioning(bucket) {
@@ -2553,7 +2819,10 @@ export const mockBackend: Backend = {
       textWeight: next.textWeight,
       accent: next.accent,
       confirmCopyMove: next.confirmCopyMove,
+      // Like the backend: trimmed, empty becomes null; the field is required.
+      fileManagerCommand: typeof next.fileManagerCommand === "string" ? normalizeFileManagerCommand(next.fileManagerCommand) : next.fileManagerCommand,
     };
+    if (candidate.fileManagerCommand === undefined) throw fail("InvalidInput", "fileManagerCommand: required.");
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
     settings = candidate;
@@ -2785,7 +3054,25 @@ export const mockBackend: Backend = {
   },
 
   async revealInFolder(path) {
-    console.info("[mock] reveal in folder:", path);
+    revealCallLog.push({ command: settings.fileManagerCommand, path, at: new Date().toISOString() });
+    if (settings.fileManagerCommand) mockSpawnFileManager(settings.fileManagerCommand, path);
+    console.info("[mock] reveal in folder:", path, settings.fileManagerCommand ?? "(system file manager)");
+  },
+
+  async tryFileManager(command, path) {
+    await delay(80);
+    tryFileManagerCallLog.push({ command, path, at: new Date().toISOString() });
+    // Same normalization and validation as update_settings.
+    const cmd = normalizeFileManagerCommand(command);
+    const problem = validateFileManagerCommand(cmd);
+    if (problem) throw fail("InvalidInput", `fileManagerCommand: ${problem}`);
+    if (cmd) mockSpawnFileManager(cmd, path);
+    console.info("[mock] try file manager:", cmd ?? "(system file manager)", path);
+  },
+
+  async pickProgram() {
+    await delay(150);
+    return "C:\\Program Files\\totalcmd\\TOTALCMD64.EXE";
   },
 
   async onFileDrop(cb: (e: FileDropEvent) => void): Promise<Unlisten> {

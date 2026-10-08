@@ -1,5 +1,7 @@
 // Formatting and S3 key/path helpers. Pure functions only.
 
+import { OPEN_LOCAL_REFUSED_EXTENSIONS } from "./types";
+
 /** Binary units: sizes are computed in powers of 1024, so they are labelled KiB, MiB, ... */
 const UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 
@@ -199,4 +201,17 @@ export function validateFolderName(name: string): string | null {
   if (segs.some((s) => s === "." || s === "..")) return "“.” and “..” are not allowed as names";
   if (new TextEncoder().encode(segs.join("/")).length > 1000) return "Name is too long";
   return null;
+}
+
+const REFUSED_TO_OPEN = new Set<string>(OPEN_LOCAL_REFUSED_EXTENSIONS);
+
+/**
+ * `open_local` refuses this file (or folder, `x.app`): the OS could run it as a program, so the UI
+ * does not offer "Open file" / "Open folder". Trailing dots and spaces are ignored first, as the
+ * backend does (Windows drops them: `a.exe.` runs as `a.exe`); a dotfile like `.bashrc` has none.
+ */
+export function refusedToOpen(localPath: string): boolean {
+  const name = basename(localPath).replace(/[. ]+$/, "");
+  const dot = name.lastIndexOf(".");
+  return dot > 0 && REFUSED_TO_OPEN.has(name.slice(dot + 1).toLowerCase());
 }

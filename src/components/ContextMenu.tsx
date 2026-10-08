@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderOpen, FolderPlus, FolderUp, Info, Link, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
-import { navigate, openContextMenu, openModal, refresh, setDetailsOpen, setSelection, useApp } from "../store/app";
+import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp } from "../store/app";
+import { useSearch } from "../store/search";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { getSelected } from "../store/view";
@@ -25,6 +26,8 @@ export function ContextMenu() {
   const menu = useApp((s) => s.contextMenu);
   const bucket = useApp((s) => s.bucket);
   const clip = useClipboard((s) => s.clip);
+  // Over search results the menu acts on the selected hits; there is no folder to upload or paste into.
+  const inResults = useSearch((s) => s.open);
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   // One archived object that isn't restored: actions that read it are disabled, with the reason.
@@ -82,6 +85,7 @@ export function ContextMenu() {
   const { folders, objects } = getSelected();
   const groups: Item[][] = [];
   const count = folders.length + objects.length;
+  if (inResults && count === 0) return null;
 
   const pasteItem: Item = {
     label: clip ? `Paste ${plural(clip.items.length, "item")} here` : "Paste",
@@ -118,7 +122,7 @@ export function ContextMenu() {
   } else if (count === 1 && folders.length === 1) {
     const f = folders[0];
     groups.push([
-      { label: "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: "Enter" },
+      { label: inResults ? "Open folder" : "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: "Enter" },
       { label: "Download folder…", icon: <FolderDown size={14} />, action: () => void requestDownloadFolders([f]) },
     ]);
     groups.push([
@@ -142,6 +146,9 @@ export function ContextMenu() {
           : !singleInfo.archived
             ? { disabled: true, title: "Already restored" }
             : {};
+    if (inResults) {
+      groups.push([{ label: "Go to object", icon: <LocateFixed size={14} />, action: () => revealObject(bucket, o.key, o.name), hint: "Enter" }]);
+    }
     groups.push([
       {
         label: "Download…",
@@ -162,7 +169,8 @@ export function ContextMenu() {
         label: "Properties",
         icon: <Info size={14} />,
         action: () => {
-          setSelection(new Set([o.key]), o.key, o.key);
+          // Over results the hit is already the selection (the table's selection is not used there).
+          if (!inResults) setSelection(new Set([o.key]), o.key, o.key);
           setDetailsOpen(true);
         },
       },

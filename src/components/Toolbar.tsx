@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -20,8 +20,10 @@ import {
   Archive,
   ArchiveRestore,
   ArrowUp,
+  Folder,
 } from "lucide-react";
-import { navigate, openModal, refresh, setDetailsOpen, setFilter, useApp } from "../store/app";
+import { navigate, openModal, readPref, refresh, setDetailsOpen, setFilter, useApp, writePref } from "../store/app";
+import { leaveSearch, rerunSearch, runSearch, setSearchScope, useSearch } from "../store/search";
 import { clearClipboard, useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, useArchiveBlocked } from "../store/archive";
@@ -91,12 +93,118 @@ function UploadButton({ disabled }: { disabled: boolean }) {
   );
 }
 
-export function Toolbar() {
+const HINT_KEY = "s3x.searchHintDismissed";
+
+/**
+ * The toolbar box: typing filters the loaded rows (unchanged), Enter searches the bucket, Ctrl+F
+ * focuses it, Esc clears it and leaves the results. The scope control sits beside it.
+ */
+function SearchBox() {
   const bucket = useApp((s) => s.bucket);
   const prefix = useApp((s) => s.prefix);
   const filter = useApp((s) => s.filter);
+  const scope = useSearch((s) => s.scope);
+  const searchOpen = useSearch((s) => s.open);
+  const input = useRef<HTMLInputElement>(null);
+  const [focused, setFocused] = useState(false);
+  const [hintDismissed, setHintDismissed] = useState(() => readPref<boolean>(HINT_KEY, false));
+  const disabled = !bucket;
+
+  // Ctrl+F (Cmd+F) focuses the box, unless a dialog is open.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== "f") return;
+      if (useApp.getState().modal) return;
+      e.preventDefault();
+      input.current?.focus();
+      input.current?.select();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const clear = leaveSearch;
+  const dismissHint = () => {
+    setHintDismissed(true);
+    writePref(HINT_KEY, true);
+  };
+  const folderTitle = `Search this folder: s3://${bucket ?? ""}/${prefix}`;
+
+  return (
+    <div className="search-wrap">
+      <div className={`search-box toolbar-search ${searchOpen ? "searching" : ""}`}>
+        <Search size={13} />
+        <input
+          ref={input}
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter · press Enter to search"
+          aria-label="Filter loaded items; press Enter to search"
+          spellCheck={false}
+          disabled={disabled}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              clear();
+            } else if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              runSearch(filter);
+            }
+          }}
+        />
+        {(filter || searchOpen) && (
+          <button className="icon-btn" onClick={clear} aria-label="Clear" title="Clear (Esc)">
+            <X size={12} />
+          </button>
+        )}
+        {focused && !filter && !hintDismissed && (
+          <div className="search-hint" role="note" onMouseDown={(e) => e.preventDefault()}>
+            <span>
+              Enter searches: <code>word</code> <code>"a phrase"</code> <code>-not</code> <code>tag:key=value</code> <code>folder/part</code>
+            </span>
+            <button className="icon-btn" onClick={dismissHint} aria-label="Dismiss hint" title="Don't show again">
+              <X size={11} />
+            </button>
+          </div>
+        )}
+      </div>
+      <div className="segmented scope-seg" role="group" aria-label="Search scope">
+        <button
+          className={scope === "folder" ? "active" : ""}
+          aria-pressed={scope === "folder"}
+          disabled={disabled}
+          onClick={() => setSearchScope("folder")}
+          title={folderTitle}
+        >
+          <Folder size={12} />
+          <span className="seg-long">This folder</span>
+          <span className="seg-short">Folder</span>
+        </button>
+        <button
+          className={scope === "bucket" ? "active" : ""}
+          aria-pressed={scope === "bucket"}
+          disabled={disabled}
+          onClick={() => setSearchScope("bucket")}
+          title={`Search the whole bucket: s3://${bucket ?? ""}/`}
+        >
+          <Archive size={12} />
+          <span className="seg-long">Whole bucket</span>
+          <span className="seg-short">Bucket</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function Toolbar() {
+  const bucket = useApp((s) => s.bucket);
+  const prefix = useApp((s) => s.prefix);
   const loading = useApp((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
+  const searchOpen = useSearch((s) => s.open);
+  const searching = useSearch((s) => s.loading);
   const sel = useSelectionInfo();
   const selCount = sel.folders + sel.objects;
   const clip = useClipboard((s) => s.clip);
@@ -113,8 +221,9 @@ export function Toolbar() {
   return (
     <div className="toolbar">
       <div className="tool-group">
-        <UploadButton disabled={disabled} />
-        <button className="btn" disabled={disabled} onClick={() => openModal({ kind: "newFolder" })} title="New folder">
+        {/* No folder is in view while search results are open: nothing to upload or create into. */}
+        <UploadButton disabled={disabled || searchOpen} />
+        <button className="btn" disabled={disabled || searchOpen} onClick={() => openModal({ kind: "newFolder" })} title={searchOpen ? "Go back to a folder to create one" : "New folder"}>
           <FolderPlus size={14} />
           <span className="btn-label secondary">New folder</span>
         </button>
@@ -163,9 +272,9 @@ export function Toolbar() {
         </button>
         <button
           className="icon-btn lg"
-          disabled={disabled || !clip}
+          disabled={disabled || !clip || searchOpen}
           onClick={() => requestPaste()}
-          title={clip ? `Paste into this folder (Ctrl+V)` : "Paste (clipboard is empty)"}
+          title={searchOpen ? "Go back to a folder to paste into it" : clip ? `Paste into this folder (Ctrl+V)` : "Paste (clipboard is empty)"}
           aria-label="Paste"
         >
           <ClipboardPaste size={15} />
@@ -203,8 +312,13 @@ export function Toolbar() {
         <button className="icon-btn lg" disabled={disabled || !prefix} onClick={() => bucket && navigate(bucket, parentPrefix(prefix))} title="Up one level (Backspace)">
           <ArrowUp size={15} />
         </button>
-        <button className="icon-btn lg" disabled={disabled} onClick={() => refresh()} title="Refresh">
-          <RefreshCw size={15} className={loading ? "spin" : ""} />
+        <button
+          className="icon-btn lg"
+          disabled={disabled}
+          onClick={() => (searchOpen ? rerunSearch() : refresh())}
+          title={searchOpen ? "Search again" : "Refresh"}
+        >
+          <RefreshCw size={15} className={(searchOpen ? searching : loading) ? "spin" : ""} />
         </button>
       </div>
       <div className="tool-group right">
@@ -222,24 +336,7 @@ export function Toolbar() {
             </button>
           </div>
         )}
-        <div className="search-box toolbar-search">
-          <Search size={13} />
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter loaded items"
-            spellCheck={false}
-            disabled={disabled}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setFilter("");
-            }}
-          />
-          {filter && (
-            <button className="icon-btn" onClick={() => setFilter("")} aria-label="Clear filter">
-              <X size={12} />
-            </button>
-          )}
-        </div>
+        <SearchBox />
         <button
           className={`icon-btn lg ${detailsOpen ? "active" : ""}`}
           onClick={() => setDetailsOpen(!detailsOpen)}
@@ -261,6 +358,8 @@ export function Breadcrumbs() {
   const rows = useViewRows();
   const filter = useApp((s) => s.filter);
   const sel = useSelectionInfo();
+  // While search results are open they say what they hold; the folder's counts would only confuse.
+  const searchOpen = useSearch((s) => s.open);
   if (!bucket) return null;
   const segs = prefixSegments(prefix);
   const selCount = sel.folders + sel.objects;
@@ -300,7 +399,7 @@ export function Breadcrumbs() {
           <Copy size={12} />
         </button>
       </nav>
-      <div className="crumb-info muted">
+      <div className="crumb-info muted" hidden={searchOpen}>
         {selCount > 0 && (
           <span className="sel-info">
             {selCount.toLocaleString()} selected{sel.objects > 0 ? ` · ${formatBytes(sel.bytes)}` : ""}

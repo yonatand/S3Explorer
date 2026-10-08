@@ -1,8 +1,9 @@
 // Derived view of the current listing: filtered + sorted rows, folders first.
 
 import { useMemo } from "react";
-import type { FolderEntry, ObjectEntry } from "../lib/types";
+import type { FolderEntry, ObjectEntry, SearchHit } from "../lib/types";
 import { matchesFilter, useApp, type SortState } from "./app";
+import { hitId, useSearch } from "./search";
 
 export type Row =
   | { kind: "folder"; id: string; name: string; folder: FolderEntry }
@@ -73,11 +74,29 @@ export function getViewRows(): Row[] {
   return computeRows(s.listing.folders, s.listing.objects, s.filter, s.sort);
 }
 
+/** The selected search hits, in result order (the results view is open). */
+function selectedHits(selection: Set<string>, hits: SearchHit[]): { folders: FolderEntry[]; objects: ObjectEntry[] } {
+  const folders: FolderEntry[] = [];
+  const objects: ObjectEntry[] = [];
+  if (selection.size) {
+    for (const h of hits) {
+      if (!selection.has(hitId(h))) continue;
+      if (h.kind === "folder" && h.folder) folders.push(h.folder);
+      else if (h.kind === "object" && h.entry) objects.push(h.entry);
+    }
+  }
+  return { folders, objects };
+}
+
 /**
  * Selected entries, in listing order, limited to rows the current filter shows: an action never
  * includes an item the user can't see (setFilter also prunes hidden ones from the selection).
+ * While search results are open, the selected result rows are the selection: their entries are
+ * returned exactly as the search reported them (keys and prefixes byte-for-byte).
  */
 export function getSelected(): { folders: FolderEntry[]; objects: ObjectEntry[] } {
+  const search = useSearch.getState();
+  if (search.open) return selectedHits(search.selection, search.result?.hits ?? []);
   const { selection, listing } = useApp.getState();
   if (!selection.size) return { folders: [], objects: [] };
   const visible = new Set(getViewRows().map((r) => r.id));
@@ -87,11 +106,46 @@ export function getSelected(): { folders: FolderEntry[]; objects: ObjectEntry[] 
   };
 }
 
-/** Hook: counts of selected visible folders/objects (same rule as getSelected). */
+/** Hook: counts of selected visible folders/objects (same rule as getSelected, results included). */
 export function useSelectionInfo() {
   const selection = useApp((s) => s.selection);
   const rows = useViewRows();
-  return useMemo(() => summarize(selection, rows), [selection, rows]);
+  const searchOpen = useSearch((s) => s.open);
+  const searchSelection = useSearch((s) => s.selection);
+  const hits = useSearch((s) => s.result?.hits);
+  return useMemo(() => {
+    if (!searchOpen) return summarize(selection, rows);
+    const { folders, objects } = selectedHits(searchSelection, hits ?? []);
+    const asRows: Row[] = [
+      ...folders.map((folder): Row => ({ kind: "folder", id: folder.prefix, name: folder.name, folder })),
+      ...objects.map((object): Row => ({ kind: "object", id: object.key, name: object.name, object })),
+    ];
+    return summarize(new Set(asRows.map((r) => r.id)), asRows);
+  }, [searchOpen, searchSelection, hits, selection, rows]);
+}
+
+/**
+ * The folder the selected items are listed in: the open folder, or (search results) the folder all
+ * selected hits share, else the deepest folder that contains them all.
+ */
+export function getSelectionPrefix(): string {
+  const search = useSearch.getState();
+  const { prefix } = useApp.getState();
+  if (!search.open) return prefix;
+  const { folders, objects } = getSelected();
+  const parents = [
+    ...folders.map((f) => f.prefix.slice(0, f.prefix.length - f.name.length - 1)),
+    ...objects.map((o) => o.key.slice(0, o.key.length - o.name.length)),
+  ];
+  if (!parents.length) return prefix;
+  let common = parents[0];
+  for (const p of parents) {
+    while (!p.startsWith(common)) {
+      const cut = common.slice(0, -1).lastIndexOf("/");
+      common = cut >= 0 ? common.slice(0, cut + 1) : "";
+    }
+  }
+  return common;
 }
 
 function summarize(selection: Set<string>, rows: Row[]) {

@@ -11,6 +11,9 @@ import { DragBadge } from "./RowDrag";
 import { Sidebar } from "./Sidebar";
 import { Breadcrumbs, Toolbar } from "./Toolbar";
 import { ObjectTable } from "./ObjectTable";
+import { SearchResults } from "./SearchResults";
+import { useSearch } from "../store/search";
+import { toast } from "../store/toasts";
 import { DetailsPanel } from "./DetailsPanel";
 import { ActivityPanel } from "./TransfersPanel";
 import { ContextMenu } from "./ContextMenu";
@@ -90,8 +93,11 @@ function useFileDrop() {
         else if (e.type === "leave") setDragging(false);
         else {
           setDragging(false);
-          // Files upload right away; a folder opens the upload-folder confirmation.
-          if (e.paths.length) void handleOsDrop(e.paths);
+          // Files upload right away; a folder opens the upload-folder confirmation. Not while search
+          // results are open: no folder is in view to upload into.
+          if (!e.paths.length) return;
+          if (useSearch.getState().open) toast.info("Go back to a folder to upload", "Search results are open; nothing was uploaded.");
+          else void handleOsDrop(e.paths);
         }
       })
       .then((u) => (disposed ? u() : (unlisten = u)))
@@ -153,6 +159,7 @@ export function Explorer() {
   // Details describe an item inside a bucket, so the panel stays closed until one is open.
   const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
   const prefix = useApp((s) => s.prefix);
+  const searchOpen = useSearch((s) => s.open) && bucket !== null;
   const dragging = useFileDrop();
   const sidebar = useSidebarResize();
 
@@ -189,12 +196,14 @@ export function Explorer() {
           {bucket && <Toolbar />}
           {bucket && <Breadcrumbs />}
           <div className="table-wrap">
-            <ObjectTable />
+            {searchOpen ? <SearchResults /> : <ObjectTable />}
             {dragging && (
               <div className={`drop-overlay ${bucket ? "" : "disabled"}`}>
                 <div className="drop-card">
                   <UploadCloud size={34} strokeWidth={1.5} />
-                  <div className="drop-title">{bucket ? "Drop files or a folder to upload" : "Select a bucket first"}</div>
+                  <div className="drop-title">
+                    {!bucket ? "Select a bucket first" : searchOpen ? "Go back to a folder to upload" : "Drop files or a folder to upload"}
+                  </div>
                   {bucket && <div className="muted mono small">s3://{bucket}/{prefix}</div>}
                 </div>
               </div>

@@ -194,6 +194,8 @@ export function TransferBackdrop() {
   // Hidden game: clicking a server SECRET_CLICKS times in quick succession starts it.
   const [playing, setPlaying] = useState(false);
   const clicks = useRef<number[]>([]);
+  /** The lock request in flight (or done) for the current game; null when no game was started. */
+  const locking = useRef<Promise<void> | null>(null);
   const countClick = () => {
     const now = Date.now();
     clicks.current = [...clicks.current.filter((t) => now - t < SECRET_WINDOW_MS), now];
@@ -201,7 +203,7 @@ export function TransferBackdrop() {
       clicks.current = [];
       // The game is played at the window's default size: lock the window there first, so the game
       // measures the final layout, and start even if the window could not be locked.
-      void api
+      locking.current = api
         .lockWindowSize(true)
         .catch(() => {})
         .then(() => setPlaying(true));
@@ -209,8 +211,19 @@ export function TransferBackdrop() {
   };
   const stopPlaying = useCallback(() => {
     setPlaying(false);
+    locking.current = null;
     api.lockWindowSize(false).catch(() => {});
   }, []);
+  // The start screen can go away with the game still open (a saved connection connects, the window
+  // closes): never leave the window locked then.
+  // A lock still in flight is waited for, so the unlock lands after it.
+  useEffect(
+    () => () => {
+      const pending = locking.current;
+      if (pending) void pending.then(() => api.lockWindowSize(false)).catch(() => {});
+    },
+    [],
+  );
 
   // The frame the servers and routes are laid out on, in grid cells. With tiles on screen it hugs
   // them, so the picture stays together on a large window; otherwise it is the window itself.

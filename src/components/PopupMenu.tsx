@@ -9,6 +9,10 @@ export interface PopupMenuItem {
   action(): void;
   danger?: boolean;
   disabled?: boolean;
+  /** Tooltip, e.g. why the item is disabled. */
+  title?: string;
+  /** Short text after the label (dimmed). */
+  hint?: string;
 }
 
 export function PopupMenu({ x, y, groups, onClose, label }: { x: number; y: number; groups: PopupMenuItem[][]; onClose(): void; label: string }) {
@@ -84,6 +88,7 @@ export function PopupMenu({ x, y, groups, onClose, label }: { x: number; y: numb
                 role="menuitem"
                 className={`menu-item ${item.danger ? "danger" : ""}`}
                 disabled={item.disabled}
+                title={item.title}
                 onClick={() => {
                   closeRef.current();
                   item.action();
@@ -91,6 +96,7 @@ export function PopupMenu({ x, y, groups, onClose, label }: { x: number; y: numb
               >
                 {item.icon}
                 <span className="menu-label">{item.label}</span>
+                {item.hint && <span className="menu-hint">{item.hint}</span>}
               </button>
             ))}
           </div>

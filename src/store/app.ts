@@ -303,7 +303,18 @@ export async function removeSharedBucket(name: string): Promise<void> {
 
 // ---- navigation / listing ------------------------------------------------------------
 
+const navigateListeners = new Set<() => void>();
+/**
+ * Called at the start of every navigation (any `navigate` or `revealObject`, including to the
+ * current folder), before the selection changes. The search results close here.
+ */
+export function onNavigate(cb: () => void): () => void {
+  navigateListeners.add(cb);
+  return () => navigateListeners.delete(cb);
+}
+
 export function navigate(bucket: string, prefix: string) {
+  navigateListeners.forEach((cb) => cb());
   // Server-provided prefixes are used verbatim (see asFolderPrefix / normalizePrefix).
   const p = asFolderPrefix(prefix);
   set({
