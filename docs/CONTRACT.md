@@ -1236,7 +1236,7 @@ If the command names no placeholder, `{dir}` is appended as the last argument. E
 
 | Command | Args | Returns |
 |---|---|---|
-| `reveal_local` | `{ path }` | `void`. With `fileManagerCommand` null: the opener plugin's reveal (select the item in the OS file manager), on the Rust side. Otherwise: spawn the program with the substituted arguments, detached, without waiting. The program must exist as a file (`InvalidInput` "File manager not found: …" otherwise); a spawn failure is `Io` with the OS message. The path itself is not restricted (reveal only shows it), but it must be absolute. |
+| `reveal_local` | `{ path }` | `void`. With `fileManagerCommand` null: the opener plugin's reveal (select the item in the OS file manager), on the Rust side. Otherwise: spawn the program with the substituted arguments, detached, without waiting. The program must exist as a file, or be a bare name found on `PATH` (with `PATHEXT` on Windows); the resolved absolute path is what runs (`InvalidInput` "File manager not found: …" otherwise); a spawn failure is `Io` with the OS message. The path itself is not restricted (reveal only shows it), but it must be absolute. |
 
 - `open_local` on a **directory** goes through the same override (`{path}` = `{dir}` = the directory);
   `open_local` on a file still opens the file with its default application, never the file manager.
