@@ -1247,7 +1247,7 @@ If the command names no placeholder, `{dir}` is appended as the last argument. E
   manager** (default) and **This program**, which reveals a text field for the command, a **Browse…**
   button (the dialog plugin's file picker, which inserts the chosen program quoted, followed by
   ` "{dir}"`), a one-line explanation of `{path}` and `{dir}`, and a **Try it** button that calls
-  `reveal_local` on the settings file's directory with the *unsaved* field value (`try_file_manager
+  `try_file_manager` with the *unsaved* field value on the newest completed download, or the file-system root when there is none, (`try_file_manager
   { command, path }` below) and toasts the error if it fails. Saving an invalid command is refused with
   the backend's message under the field, like the other settings.
 
@@ -1256,7 +1256,14 @@ If the command names no placeholder, `{dir}` is appended as the last argument. E
 | `try_file_manager` | `{ command: string | null, path: string }` | `void`. Same as `reveal_local` but with the given command instead of the saved setting, so the user can test before saving. |
 
 - The command never runs through a shell, so there is no quoting the user can get wrong beyond the double
-  quotes above; `%VAR%` and `$VAR` are not expanded.
+  quotes above; `%VAR%` and `$VAR` are not expanded. The one exception is a `.bat`/`.cmd` program, which
+  Windows itself runs through `cmd.exe` (arguments are escaped by the runtime); Browse… therefore offers
+  only `.exe`/`.com` on Windows. A program whose file name is a shell or script host (`cmd`, `powershell`,
+  `pwsh`, `wscript`, `cscript`, `mshta`, `sh`, `bash`, `zsh`, `fish`, with or without `.exe`) is refused
+  with `InvalidInput`: a file manager is never one of those. A program with a relative directory part is
+  refused, and relative `PATH` entries are skipped, so nothing depends on the working directory. On Windows
+  a bare name without an extension tries only the `PATHEXT` extensions (like `cmd.exe` does), never the
+  extensionless file. On macOS, choosing an `.app` bundle in Browse… inserts `open -a "<bundle>" "{dir}"`.
 
 ### Hidden game (from PR #2): window lock
 
