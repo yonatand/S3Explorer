@@ -438,15 +438,19 @@ export interface ParsedSearch {
 }
 
 export interface SearchHit {
-  entry: ObjectEntry;
-  /** Filled only when the query has tag terms. */
+  kind: "object" | "folder";
+  /** Set for kind "object". */
+  entry: ObjectEntry | null;
+  /** Set for kind "folder"; the prefix is passed through byte-for-byte. */
+  folder: FolderEntry | null;
+  /** Objects only, and only when the query has tag terms. */
   tags: Tag[] | null;
-  /** The HeadObject hit on `exactPath`. */
+  /** The exact-path hit (an object headed, or a folder listed, from `exactPath`). */
   exact: boolean;
 }
 
 export interface SearchResult {
-  /** The exact hit first (if any), then in key order. */
+  /** Exact hits first, then folders in prefix order, then objects in key order. */
   hits: SearchHit[];
   /** Keys the scan looked at. */
   scanned: number;

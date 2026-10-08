@@ -1166,6 +1166,46 @@ Frontend:
 - Changing bucket or disconnecting closes the results view. Refresh re-runs the same search.
 - The mock implements the same parser and scan over its in-memory buckets, including tag terms and the caps.
 
+### Search: folders are hits, and results carry a selection (settled after the first dev run)
+
+**Folders are results.** The scan derives every folder below `listPrefix` from the keys it sees (each
+`/`-delimited ancestor of a key, plus folder-marker keys ending in `/`). A folder is a hit when its full
+prefix matches every word, phrase and exclusion term (same matching as objects, on the full prefix string).
+Queries with tag terms produce no folder hits (folders have no tags). Folder hits are de-duplicated, come
+**before** object hits (as in the table), are in prefix order, and count toward `limit`.
+
+```ts
+interface SearchHit {
+  kind: "object" | "folder";
+  entry: ObjectEntry | null;     // kind "object"
+  folder: FolderEntry | null;    // kind "folder"; prefix passed through byte-for-byte
+  tags: Tag[] | null;            // objects only, when the query has tag terms
+  exact: boolean;                // the exact-path hit (object or folder)
+}
+```
+
+**Exact path for folders.** When the whole query is a single unquoted path term, besides the `HeadObject`
+on the key the backend also checks the term as a folder: `ListObjectsV2` with `prefix` = the term with a
+`/` appended if it lacks one, `max-keys` 1. If anything is listed, the folder is an exact hit (`kind:
+"folder"`, `exact: true`) placed first. Both checks run; an exact object and an exact folder can both exist.
+The folder check is never skipped for a term ending in `/` (that is the common pasted form).
+
+**`s3://` paths.** The frontend accepts a pasted `s3://<bucket>/<key or prefix>` as the whole query: it
+strips the scheme and bucket, switches to that bucket first when it differs from the open one and is in the
+bucket list (otherwise toasts "Bucket <name> is not in this connection"), and searches the rest as a lone
+path term with scope `""`.
+
+**Selection and actions in the results view.** While results are open, the result rows **are** the
+selection: click, Ctrl/Cmd-click, Shift-click and the keyboard select exactly as in the object table, and
+`getSelected()` returns the selected hits as `{ folders, objects }`. Every toolbar and context-menu action
+that works on a table selection works on a results selection with the same confirmations: Download,
+Delete, Copy, Cut, Rename (single), Tags, Restore, Properties (details panel) and Versions for a single
+object. Upload, New folder and Paste are disabled while results are open (no visible target folder). The
+results context menu offers the same items as the table's, plus "Go to object" / "Open folder". Enter or
+double-click on an object goes to it; on a folder it navigates into it. After a delete, rename, cut-paste
+or move started from the results, the affected hits are removed from the list immediately. When results
+arrive, the first row takes focus (so a pasted path followed by Enter twice opens it).
+
 ### Activity right-click menu
 
 Every row in the Activity panel (transfers, folder transfers, jobs) opens a context menu on right-click
