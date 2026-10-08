@@ -1206,6 +1206,58 @@ The existing inline buttons stay. Items, in this order, separated into groups as
   to the current folder, a newest-files click, a breadcrumb or bucket click), so a selection can never
   exist behind the results. A cancelled run keeps showing "cancelled" in the header, never a blank view.
 
+### File manager override (setting)
+
+By default "Show in folder" opens the OS file manager with the item selected, and "Open folder" opens a
+directory in it. The user can point both at a different program instead (Total Commander, Files, Directory
+Opus, Dolphin, …).
+
+`AppSettings` gains `fileManagerCommand: string | null` (default `null`). `update_settings` requires the field
+like the others; a `settings.json` without it loads `null`. Validation: trimmed; empty becomes `null`; at
+most 1,024 characters; no control characters.
+
+```ts
+// AppSettings (v0.6.0)
+fileManagerCommand: string | null;  // null = the system file manager
+```
+
+The command is one line, split into a program and arguments by the backend (double quotes group, `\"`
+is a literal quote, no shell is ever involved), with two placeholders that are replaced **inside an
+argument** after splitting, so a path with spaces never breaks apart:
+
+| Placeholder | Replaced by |
+|---|---|
+| `{path}` | the item itself (the downloaded file, or the folder for "Open folder") |
+| `{dir}` | the directory that contains the item (for a folder: the folder itself) |
+
+If the command names no placeholder, `{dir}` is appended as the last argument. Examples:
+`"C:\Program Files\totalcmd\TOTALCMD64.EXE" /O /T "{dir}"`, `nautilus --select "{path}"`,
+`open -R "{path}"`.
+
+| Command | Args | Returns |
+|---|---|---|
+| `reveal_local` | `{ path }` | `void`. With `fileManagerCommand` null: the opener plugin's reveal (select the item in the OS file manager), on the Rust side. Otherwise: spawn the program with the substituted arguments, detached, without waiting. The program must exist as a file (`InvalidInput` "File manager not found: …" otherwise); a spawn failure is `Io` with the OS message. The path itself is not restricted (reveal only shows it), but it must be absolute. |
+
+- `open_local` on a **directory** goes through the same override (`{path}` = `{dir}` = the directory);
+  `open_local` on a file still opens the file with its default application, never the file manager.
+- The frontend no longer calls the opener plugin's `revealItemInDir` directly: `api.revealInFolder`
+  invokes `reveal_local`, and the `opener:allow-reveal-item-in-dir` capability is removed from
+  `capabilities/default.json`.
+- **Settings UI (Behavior tab):** a group "Show in folder opens" with two choices, **System file
+  manager** (default) and **This program**, which reveals a text field for the command, a **Browse…**
+  button (the dialog plugin's file picker, which inserts the chosen program quoted, followed by
+  ` "{dir}"`), a one-line explanation of `{path}` and `{dir}`, and a **Try it** button that calls
+  `reveal_local` on the settings file's directory with the *unsaved* field value (`try_file_manager
+  { command, path }` below) and toasts the error if it fails. Saving an invalid command is refused with
+  the backend's message under the field, like the other settings.
+
+| Command | Args | Returns |
+|---|---|---|
+| `try_file_manager` | `{ command: string | null, path: string }` | `void`. Same as `reveal_local` but with the given command instead of the saved setting, so the user can test before saving. |
+
+- The command never runs through a shell, so there is no quoting the user can get wrong beyond the double
+  quotes above; `%VAR%` and `$VAR` are not expanded.
+
 ### Hidden game (from PR #2): window lock
 
 `lockWindowSize(true)` is called when the start-screen game begins and must be undone on **every** exit:

@@ -134,6 +134,11 @@ export interface AppSettings extends TransferSettings {
   accent: AccentColor;
   /** v0.4.0: show the Copy/Move confirmation even when nothing conflicts. Delete always confirms. */
   confirmCopyMove: boolean;
+  /**
+   * v0.6.0: program for "Show in folder" / "Open folder" with `{path}` and `{dir}` placeholders
+   * (see "File manager override" in docs/CONTRACT.md); null = the system file manager.
+   */
+  fileManagerCommand: string | null;
 }
 
 /** Ranges and slider steps for the text settings (the backend enforces the same ranges). */
@@ -151,6 +156,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   textWeight: 400,
   accent: "yellow",
   confirmCopyMove: true,
+  fileManagerCommand: null,
 };
 
 // Saved connections
@@ -452,6 +458,8 @@ export interface SearchResult {
   reason: string | null;
   parsed: ParsedSearch;
 }
+
+export const FILE_MANAGER_COMMAND_MAX = 1024;
 
 export const SEARCH_LIMITS = {
   /** Keys scanned per search before the result is truncated. */

@@ -39,6 +39,8 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     scan of the current folder or the whole bucket (see "Search in a bucket" in `docs/CONTRACT.md`).
 24. (v0.6.0) A right-click menu on every Activity row: open the downloaded file or folder, show in folder, go
     to the object, copy key / local path / failures, cancel, remove.
+25. (v0.6.0) A setting that replaces the system file manager for "Show in folder" / "Open folder" with a
+    user-chosen program (`{path}` / `{dir}` placeholders, no shell).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.
