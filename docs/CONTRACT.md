@@ -1065,8 +1065,12 @@ and tags:
 | `tag:key` | the object has a tag with that key, any value |
 | a term with `/` (a **path term**) | matched like a word, and additionally used to narrow the listing (below) |
 
-Terms are separated by whitespace; every term must match (AND). A term is path-like when it contains
-`/` and is not quoted. Matching is always against the **full key** (so `invoice 2026` finds
+Terms are separated by Unicode whitespace; every term must match (AND). Quotes group inside a term as
+well as around it: `tag:Project="Big Data"` is one tag term with the value `Big Data`, and `foo"bar baz"`
+is the single word `foobar baz`; an unterminated quote runs to the end of the text. The `tag:` and `-`
+prefixes are matched case-insensitively (`TAG:k` is a tag term). Empty phrases (`""`) are dropped before
+anything else is decided. A term is path-like when it contains `/` and is not quoted. The Rust parser is
+authoritative; the mock mirrors it and uses the same reason wording ("Stopped at N results"). Matching is always against the **full key** (so `invoice 2026` finds
 `billing/2026/invoice-0412.pdf`), never against a display name.
 
 ```ts
@@ -1103,7 +1107,9 @@ interface SearchResult {
 | Command | Args | Returns |
 |---|---|---|
 | `search_objects` | `{ query: SearchQuery, searchId: string }` | `SearchResult`. A newer call with the same `searchId` cancels the older one, which fails with `Cancelled` (same rule as `preview_batch`), so typing never queues scans. An empty query (no terms after parsing) is `InvalidInput`. |
-| `cancel_search` | `{ searchId: string }` | `void`. Cancels the running search with that id (it fails with `Cancelled`); no-op when none is running. The UI's Cancel button calls it. |
+| `cancel_search` | `{ searchId: string }` | `void`. Cancels the running search with that id (it fails with `Cancelled`); no-op when none is running. The UI's Cancel button calls it, and so does closing the results view while a search runs. |
+
+A `search_objects` call that fails validation (empty query, bad limit) still cancels an older search with the same `searchId` first.
 
 Backend behavior:
 
@@ -1118,11 +1124,13 @@ Backend behavior:
   A narrowed listing that found keys but no hits is not retried.
 - **Exact path.** When the whole query is a single unquoted path term, `HeadObject` that key first
   (it may be outside `scope`; the key is sent byte-for-byte as typed, never normalized). A hit becomes
-  `hits[0]` with `exact: true`; `NoSuchKey` and `AccessDenied` on the head are not errors. The scan
+  `hits[0]` with `exact: true`. Any head error other than `Network`, `Auth` and `NoSuchBucket` (so also
+  `NoSuchKey`, `AccessDenied`, and 400/301-style `Unknown` errors) means "no exact hit", never a failed search. The scan
   still runs and skips that key if it meets it again. A path term ending in `/` is reported as `exactPath`
   but never headed: a folder marker is never an exact hit.
-- **Scan caps.** Stop after **50,000 keys** scanned, or when `limit` hits are found. Folder markers
-  (keys ending in `/`) are skipped and not counted. Paging follows the usual rule: a repeated
+- **Scan caps.** Stop after **50,000 keys** scanned, or when `limit` hits are found, or after **200 listing
+  pages** (a bucket made mostly of folder markers would otherwise be listed to its end). Folder markers
+  (keys ending in `/`) are skipped and not counted as scanned keys. Paging follows the usual rule: a repeated
   continuation token is an error, never a silent stop. Stopping before the end of the listing is
   `truncated: true` with a `reason`; the frontend never presents a truncated result as complete.
 - **Tags.** Tags are not in the listing, so a query with tag terms narrows by its word, phrase,
@@ -1185,12 +1193,18 @@ The existing inline buttons stay. Items, in this order, separated into groups as
 | `open_local` | `{ path }` | `void`. Opens a local file with the OS default application, or a local directory in the file manager, via the opener plugin's `open_path` on the Rust side (no new webview capability). The backend accepts **only** a path that is the `localPath` of a `completed` download transfer still in the transfer list, or the `localPath` of a download batch that is no longer active and has `doneFiles > 0`. Compared after canonicalizing both sides (case-insensitively on Windows). Anything else is `InvalidInput` ("Not a finished download"). |
 
 - `open_local` refuses to open a file whose extension is one of
-  `exe bat cmd com scr ps1 psm1 msi vbs vbe js jse wsf wsh jar sh command app reg lnk url`
+  `exe bat cmd com scr pif cpl msc hta chm scf ps1 psm1 msi msp mst vbs vbe js jse ws wsf wsh wsc jar xll jnlp gadget application appref-ms settingcontent-ms diagcab library-ms search-ms py pyw sh command app terminal fileloc inetloc desktop reg lnk url`
   (case-insensitive) with `NotSupported` ("… could be run as a program; use Show in folder"). The
   frontend hides "Open file" for those extensions instead of offering an item that fails.
 - `open_local` never follows the path through a symlink or junction whose target leaves the recorded
   destination directory: the canonical path must still start with the canonical parent recorded for
-  the transfer (same rule as folder downloads).
+  the transfer (same rule as folder downloads). For a folder batch the recorded parent is the parent of
+  the batch directory, so a batch directory replaced by a junction is refused too. The extension rule
+  applies to directories as well (a batch folder named `x.app` is refused, and the UI hides "Open folder").
+  Opening runs on a blocking thread, never on the async runtime.
+- The frontend closes the results view on **every** navigation (any `navigate`/`revealObject`, including
+  to the current folder, a newest-files click, a breadcrumb or bucket click), so a selection can never
+  exist behind the results. A cancelled run keeps showing "cancelled" in the header, never a blank view.
 
 ### Hidden game (from PR #2): window lock
 

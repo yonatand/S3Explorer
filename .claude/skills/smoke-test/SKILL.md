@@ -47,6 +47,9 @@ machine: 40 MiB upload ~300 MiB/s, download ~450 MiB/s; 512 MiB upload ~480 MiB/
 - `cargo run --release --example bench -- gen|put|get ...`: throughput, peak memory, retries and wasted bytes for one
   transfer with given part size and parallelism. Put multi-GiB data under `src-tauri/target/` (D:), never on C:.
   `throttle.mjs` in the scratchpad is a bandwidth-capping proxy for slow-link tests.
+- `cargo run --example search`: bucket search (v0.6.0): keyword/phrase/exclusion/tag terms, path narrowing and its
+  fallback, exact-path hit, limit truncation, cancellation by `searchId` and `cancel_search`, folder markers skipped.
+  Run it after any change to `src-tauri/src/search.rs`.
 - `keychain_check`, `saved_e2e`: saved connections against the real OS keychain using the TEST service name
   `dev.s3explorer.app.test`. `updater_check`: the update check and a failing-signature install against a local server.
 - Linking can fail with "paging file is too small (os error 1455)" or a spurious `E0463`; rerun with `-j 2`.

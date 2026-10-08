@@ -465,6 +465,8 @@ export const SEARCH_LIMITS = {
 
 /** `open_local` refuses these extensions (case-insensitive): the file could run as a program. */
 export const OPEN_LOCAL_REFUSED_EXTENSIONS = [
-  "exe", "bat", "cmd", "com", "scr", "ps1", "psm1", "msi", "vbs", "vbe", "js", "jse", "wsf", "wsh",
-  "jar", "sh", "command", "app", "reg", "lnk", "url",
+  "exe", "bat", "cmd", "com", "scr", "pif", "cpl", "msc", "hta", "chm", "scf", "ps1", "psm1", "msi", "msp", "mst",
+  "vbs", "vbe", "js", "jse", "ws", "wsf", "wsh", "wsc", "jar", "xll", "jnlp", "gadget", "application", "appref-ms",
+  "settingcontent-ms", "diagcab", "library-ms", "search-ms", "py", "pyw", "sh", "command", "app", "terminal",
+  "fileloc", "inetloc", "desktop", "reg", "lnk", "url",
 ] as const;
