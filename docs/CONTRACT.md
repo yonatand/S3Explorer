@@ -1064,6 +1064,7 @@ and tags:
 | `tag:key=value` | the object has a tag with exactly that key (case-sensitive, as S3) and that value (case-insensitive) |
 | `tag:key` | the object has a tag with that key, any value |
 | a term with `/` (a **path term**) | matched like a word, and additionally used to narrow the listing (below) |
+| `path:a b/c.txt` or `path:"a b/c.txt"` | a path term that may contain spaces (the `path:` prefix is case-insensitive; quotes group as usual and are dropped); it narrows the listing and is exact-path eligible like an unquoted path term |
 
 Terms are separated by Unicode whitespace; every term must match (AND). Quotes group inside a term as
 well as around it: `tag:Project="Big Data"` is one tag term with the value `Big Data`, and `foo"bar baz"`
@@ -1193,7 +1194,8 @@ The folder check is never skipped for a term ending in `/` (that is the common p
 **`s3://` paths.** The frontend accepts a pasted `s3://<bucket>/<key or prefix>` as the whole query: it
 strips the scheme and bucket, switches to that bucket first when it differs from the open one and is in the
 bucket list (otherwise toasts "Bucket <name> is not in this connection"), and searches the rest as a lone
-path term with scope `""`.
+path term with scope `""`, sent as `path:"<rest>"` (quotes inside escaped as `\"`) so a path with spaces stays one term.
+Hits removed after a job are removed when the job **finishes**, and only the keys it reports done (failed keys stay).
 
 **Selection and actions in the results view.** While results are open, the result rows **are** the
 selection: click, Ctrl/Cmd-click, Shift-click and the keyboard select exactly as in the object table, and
