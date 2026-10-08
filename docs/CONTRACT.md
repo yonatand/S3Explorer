@@ -1110,6 +1110,11 @@ Backend behavior:
   term up to and including its last `/`: when `dir` starts with `scope`, list `dir` instead; when
   `scope` starts with `dir`, keep `scope`; otherwise keep `scope` (the term can still match as a word).
   With several path terms use the longest `dir` that qualifies. `parsed.listPrefix` reports the choice.
+- **Narrowing fallback.** S3 prefixes are case-sensitive, so a narrowed listing uses the path term with the
+  case typed. When the narrowed listing (`listPrefix` longer than `scope`) ends with **zero keys scanned**, the
+  scan runs again from `scope` so the path term can still match as a case-insensitive word (`Photos/2024` then
+  finds `photos/2024/x.jpg`); `parsed.listPrefix` reports `scope` and `scanned` counts only the second scan.
+  A narrowed listing that found keys but no hits is not retried.
 - **Exact path.** When the whole query is a single unquoted path term, `HeadObject` that key first
   (it may be outside `scope`; the key is sent byte-for-byte as typed, never normalized). A hit becomes
   `hits[0]` with `exact: true`; `NoSuchKey` and `AccessDenied` on the head are not errors. The scan
