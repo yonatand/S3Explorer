@@ -1103,6 +1103,7 @@ interface SearchResult {
 | Command | Args | Returns |
 |---|---|---|
 | `search_objects` | `{ query: SearchQuery, searchId: string }` | `SearchResult`. A newer call with the same `searchId` cancels the older one, which fails with `Cancelled` (same rule as `preview_batch`), so typing never queues scans. An empty query (no terms after parsing) is `InvalidInput`. |
+| `cancel_search` | `{ searchId: string }` | `void`. Cancels the running search with that id (it fails with `Cancelled`); no-op when none is running. The UI's Cancel button calls it. |
 
 Backend behavior:
 
@@ -1118,7 +1119,8 @@ Backend behavior:
 - **Exact path.** When the whole query is a single unquoted path term, `HeadObject` that key first
   (it may be outside `scope`; the key is sent byte-for-byte as typed, never normalized). A hit becomes
   `hits[0]` with `exact: true`; `NoSuchKey` and `AccessDenied` on the head are not errors. The scan
-  still runs and skips that key if it meets it again.
+  still runs and skips that key if it meets it again. A path term ending in `/` is reported as `exactPath`
+  but never headed: a folder marker is never an exact hit.
 - **Scan caps.** Stop after **50,000 keys** scanned, or when `limit` hits are found. Folder markers
   (keys ending in `/`) are skipped and not counted. Paging follows the usual rule: a repeated
   continuation token is an error, never a silent stop. Stopping before the end of the listing is
