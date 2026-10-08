@@ -1,10 +1,25 @@
-<p align="center"><img src="src-tauri/icons/128x128@2x.png" width="112" alt="S3 Explorer icon"></p>
+<p align="center"><img src="src-tauri/icons/128x128@2x.png" width="110" alt="S3 Explorer"></p>
 
-# S3 Explorer
+<h1 align="center">S3 Explorer</h1>
 
-A fast desktop file manager for Amazon S3 and S3-compatible storage, with whole-folder transfers, object versions, archive restores, and a proper editor for lifecycle rules and tags. One small native executable, no Electron, no subscription.
+<p align="center"><strong>Your buckets, on your desktop.</strong></p>
 
-![A bucket open, with a copy and a download running in the Activity panel](docs/screenshots/explorer.png)
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/yonatand/S3Explorer?label=latest&color=ffb81f&style=for-the-badge" alt="Latest version"></a>
+  <img src="https://img.shields.io/badge/Windows%20%7C%20macOS%20%7C%20Linux-18181b?style=for-the-badge" alt="Windows, macOS and Linux">
+</p>
+
+<h3 align="center">A fast desktop file manager for Amazon S3 and S3-compatible storage, with whole-folder transfers, object versions, archive restores, and a proper editor for lifecycle rules and tags.<br>One small native executable, no Electron, no subscription.</h3>
+
+<p align="center"><a href="../../releases/latest"><strong>Download the latest release</strong></a></p>
+
+<p align="center">
+  <img src="docs/screenshots/banner.svg" alt="Files moving between a computer and an S3 bucket in parallel parts" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/showcase.png" alt="S3 Explorer: the start screen with saved connections and a bucket open" width="100%">
+</p>
 
 ## Why this exists
 
@@ -34,15 +49,38 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Light, dark or system theme**, four accent colours, and size and text-weight sliders.
 - **Updates from inside the app.** Check for a new version, read its patch notes, install it. Only updates signed by this project are installed.
 
-![Uploading a folder: the preview, the destination, and what already exists](docs/screenshots/folders.png)
+<p align="center">
+  <img src="docs/screenshots/explorer.png" alt="A bucket open, with a file selected and its details showing" width="100%">
+</p>
 
-![Lifecycle rules, each summarised in plain language, with the ones that delete data marked](docs/screenshots/lifecycle.png)
+<p align="center">
+  <img src="docs/screenshots/transfers.png" alt="The Activity panel: three large downloads in parallel parts and an upload, with speed, parts done and time remaining" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/safety.png" alt="Before a move or a delete: the exact keys, the totals, and nothing overwritten unless you choose it" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/folders.png" alt="Uploading a folder: the preview, the destination, and what already exists" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/lifecycle.png" alt="Lifecycle rules, each summarised in plain language, with the ones that delete data marked" width="100%">
+</p>
 
 | | |
 |---|---|
 | ![Saving lifecycle rules: what changed, and every rule that deletes data in red](docs/screenshots/lifecycle-confirm.png) | ![Editing an object's tags](docs/screenshots/tags.png) |
 | ![Every version of an object, with a delete marker](docs/screenshots/versions.png) | ![Restoring an archived object](docs/screenshots/restore.png) |
-| ![Saved connections on the start screen](docs/screenshots/connections.png) | ![The explorer in the light theme](docs/screenshots/light.png) |
+
+<p align="center">
+  <img src="docs/screenshots/newest-files.png" alt="Newest files in the sidebar: what changed in the bucket last, filtered by age, type or a search" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/accents.png" alt="The accent colour: yellow, green, blue or red" width="100%">
+</p>
 
 ### What it does not do (yet)
 

@@ -1,4 +1,6 @@
-import { useEffect, useState, useSyncExternalStore, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
+import * as api from "../lib/api";
+import { DefendGame } from "./DefendGame";
 
 /** Grid cell size in px. Keep in sync with `--cell` on `.backdrop` in styles.css. */
 const CELL = 48;
@@ -47,13 +49,26 @@ const toPath = (points: Cell[]) => "M" + points.map(([x, y]) => `${x * CELL} ${y
 /**
  * A small rack server centred on a grid cell: a case, three units, each with two lights and vents.
  * Behind it a ring the shape of the case keeps expanding and fading, like a signal going out.
- * `color` tints its lights and ring; without it they use the accent colour.
+ * `color` tints its lights and ring; without it they use the accent colour. It can be clicked,
+ * which does nothing visible (see the hidden game in TransferBackdrop).
  */
-function ServerDrawing({ at: [x, y], ringDelay, color }: { at: Cell; ringDelay: number; color?: string }) {
+function ServerDrawing({
+  at: [x, y],
+  ringDelay,
+  color,
+  onClick,
+}: {
+  at: Cell;
+  ringDelay: number;
+  color?: string;
+  onClick(): void;
+}) {
   return (
     <g
+      className="server"
       transform={`translate(${x * CELL - SERVER_W / 2} ${y * CELL - SERVER_H / 2})`}
       style={{ "--pulse-color": color } as CSSProperties}
+      onClick={onClick}
     >
       <rect className="server-ring" width={SERVER_W} height={SERVER_H} rx={9} style={{ animationDelay: `${ringDelay}s` }} />
       <rect className="server-case" width={SERVER_W} height={SERVER_H} rx={9} />
@@ -163,6 +178,10 @@ function arrivalSeconds(points: Cell[], to: TileBox, seconds: number): number {
   return (journey * seconds) / 3;
 }
 
+/** The hidden game starts after this many clicks on a server within this long. */
+const SECRET_CLICKS = 5;
+const SECRET_WINDOW_MS = 2000;
+
 /**
  * Decoration behind the start screen: three servers scattered on a faint grid, and pulses that
  * wander along the grid lines. Some run between servers, others head off into the grid or arrive
@@ -171,6 +190,27 @@ function arrivalSeconds(points: Cell[], to: TileBox, seconds: number): number {
 export function TransferBackdrop() {
   const [columns, rows] = useSyncExternalStore(subscribeToResize, gridSize).split(",").map(Number);
   const { tiles, list } = useTileBoxes();
+
+  // Hidden game: clicking a server SECRET_CLICKS times in quick succession starts it.
+  const [playing, setPlaying] = useState(false);
+  const clicks = useRef<number[]>([]);
+  const countClick = () => {
+    const now = Date.now();
+    clicks.current = [...clicks.current.filter((t) => now - t < SECRET_WINDOW_MS), now];
+    if (clicks.current.length >= SECRET_CLICKS) {
+      clicks.current = [];
+      // The game is played at the window's default size: lock the window there first, so the game
+      // measures the final layout, and start even if the window could not be locked.
+      void api
+        .lockWindowSize(true)
+        .catch(() => {})
+        .then(() => setPlaying(true));
+    }
+  };
+  const stopPlaying = useCallback(() => {
+    setPlaying(false);
+    api.lockWindowSize(false).catch(() => {});
+  }, []);
 
   // The frame the servers and routes are laid out on, in grid cells. With tiles on screen it hugs
   // them, so the picture stays together on a large window; otherwise it is the window itself.
@@ -242,39 +282,44 @@ export function TransferBackdrop() {
   ];
 
   return (
-    <svg className="backdrop" aria-hidden="true">
-      {deliveries.map(({ to: { color, ...box }, seconds, delay, arrival }, i) => (
-        // A blurred copy of the tile behind it: only its soft edge shows, as a glow around the tile.
-        // Its cycle starts later than the pulse's by the time the pulse needs to reach the tile.
-        <rect
-          key={i}
-          className="tile-aura"
-          {...box}
-          rx={14}
-          style={{ "--seconds": `${seconds}s`, "--delay": `${delay + arrival}s`, "--pulse-color": color } as CSSProperties}
-        />
-      ))}
-      {routes.map((route, i) => (
-        <g
-          key={i}
-          className={`backdrop-pulse ${route.to ? "delivery" : ""}`}
-          style={
-            {
-              "--seconds": `${route.seconds}s`,
-              "--delay": `${route.delay}s`,
-              "--pulse-color": route.to?.color,
-            } as CSSProperties
-          }
-        >
-          {PULSE_LAYERS.map((layer) => (
-            <path key={layer} className={layer} d={toPath(route.points)} pathLength={100} />
-          ))}
-        </g>
-      ))}
-      {/* Same order as the deliveries, so each server shows the colour of the tile it sends to. */}
-      {servers.map((cell, i) => (
-        <ServerDrawing key={i} at={cell} ringDelay={i * -1.7} color={deliveries[i]?.to.color} />
-      ))}
-    </svg>
+    <>
+      <svg className="backdrop" aria-hidden="true">
+        {deliveries.map(({ to: { color, ...box }, seconds, delay, arrival }, i) => (
+          // A blurred copy of the tile behind it: only its soft edge shows, as a glow around the tile.
+          // Its cycle starts later than the pulse's by the time the pulse needs to reach the tile.
+          <rect
+            key={i}
+            className="tile-aura"
+            {...box}
+            rx={14}
+            style={{ "--seconds": `${seconds}s`, "--delay": `${delay + arrival}s`, "--pulse-color": color } as CSSProperties}
+          />
+        ))}
+        {routes.map((route, i) => (
+          <g
+            key={i}
+            className={`backdrop-pulse ${route.to ? "delivery" : ""}`}
+            style={
+              {
+                "--seconds": `${route.seconds}s`,
+                "--delay": `${route.delay}s`,
+                "--pulse-color": route.to?.color,
+              } as CSSProperties
+            }
+          >
+            {PULSE_LAYERS.map((layer) => (
+              <path key={layer} className={layer} d={toPath(route.points)} pathLength={100} />
+            ))}
+          </g>
+        ))}
+        {/* Same order as the deliveries, so each server shows the colour of the tile it sends to. */}
+        {servers.map((cell, i) => (
+          <ServerDrawing key={i} at={cell} ringDelay={i * -1.7} color={deliveries[i]?.to.color} onClick={countClick} />
+        ))}
+        {/* The game gets a fourth shooter, at the top of the window; it is not part of the backdrop otherwise. */}
+        {playing && <ServerDrawing at={[Math.round(columns / 2), 2]} ringDelay={-0.8} onClick={countClick} />}
+      </svg>
+      {playing && <DefendGame onExit={stopPlaying} />}
+    </>
   );
 }

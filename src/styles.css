@@ -44,7 +44,7 @@
   --danger: #f2555a;
   --danger-soft: rgba(242, 85, 90, 0.12);
 
-  --folder: #e8b04b;
+  --folder: color-mix(in srgb, var(--accent) 85%, #d4d4d8);
   --ic-image: #c77dff;
   --ic-video: #ff6b8b;
   --ic-audio: #ff9f5a;
@@ -132,7 +132,7 @@
   --warning: #c98a12;
   --danger: #e0393f;
   --danger-soft: rgba(224, 57, 63, 0.08);
-  --folder: #d99a22;
+  --folder: color-mix(in srgb, var(--accent) 85%, #000000);
   --ic-image: #9b4dde;
   --ic-video: #e0446a;
   --ic-audio: #e07a2a;
@@ -184,7 +184,7 @@
     --warning: #c98a12;
     --danger: #e0393f;
     --danger-soft: rgba(224, 57, 63, 0.08);
-    --folder: #d99a22;
+    --folder: color-mix(in srgb, var(--accent) 85%, #000000);
     --ic-image: #9b4dde;
     --ic-video: #e0446a;
     --ic-audio: #e07a2a;
@@ -579,6 +579,30 @@ input[type="checkbox"] {
   background:
     linear-gradient(var(--backdrop-line) 1px, transparent 1px) 0 0 / var(--cell) var(--cell),
     linear-gradient(90deg, var(--backdrop-line) 1px, transparent 1px) 0 0 / var(--cell) var(--cell);
+}
+/* The backdrop ignores the pointer, except its servers: five quick clicks on one start the hidden
+   game (DefendGame), whose canvas then covers the window. */
+.backdrop .server {
+  pointer-events: auto;
+}
+/* While the game is on, the start screen's own content and the ambient pulses step aside; the
+   grid and the servers stay. */
+.playing-game .connect-home,
+.playing-game .connect-card,
+.playing-game .screen-corner {
+  visibility: hidden;
+}
+.playing-game .backdrop-pulse,
+.playing-game .tile-aura {
+  display: none;
+}
+.defend-game {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
 }
 .server-ring {
   fill: none;

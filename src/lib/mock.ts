@@ -2745,6 +2745,10 @@ export const mockBackend: Backend = {
     return windowFocus.value ?? document.hasFocus();
   },
 
+  async lockWindowSize() {
+    /* a browser tab cannot be resized from the page */
+  },
+
   async setZoom(scale) {
     // The closest a plain browser tab offers to the webview's zoom.
     document.documentElement.style.setProperty("zoom", String(scale));

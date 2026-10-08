@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize, type PhysicalSize } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -55,6 +55,11 @@ export type FileDropEvent =
   | { type: "over" }
   | { type: "drop"; paths: string[] }
   | { type: "leave" };
+
+/** The window's size when the app starts (mirrors `app.windows[0]` in src-tauri/tauri.conf.json). */
+const DEFAULT_WINDOW = { width: 1280, height: 820 };
+/** How the window was before `lockWindowSize(true)`, to restore it on unlock. */
+let windowBeforeLock: { maximized: boolean; fullscreen: boolean; size: PhysicalSize } | null = null;
 
 export interface Backend {
   listProfiles(): Promise<ProfileInfo[]>;
@@ -127,6 +132,7 @@ export interface Backend {
   /** Does the OS window have focus (not just the document)? */
   isWindowFocused(): Promise<boolean>;
   setZoom(scale: number): Promise<void>;
+  lockWindowSize(locked: boolean): Promise<void>;
   // Platform helpers (dialogs, paths, shell, drag & drop)
   pickFiles(): Promise<string[]>;
   pickSavePath(defaultName: string): Promise<string | null>;
@@ -222,6 +228,25 @@ const tauriBackend: Backend = {
   setWindowTitle: (title) => getCurrentWindow().setTitle(title),
   isWindowFocused: () => getCurrentWindow().isFocused(),
   setZoom: (scale) => getCurrentWebview().setZoom(scale),
+  async lockWindowSize(locked) {
+    const win = getCurrentWindow();
+    if (locked) {
+      windowBeforeLock = { maximized: await win.isMaximized(), fullscreen: await win.isFullscreen(), size: await win.innerSize() };
+      await win.setFullscreen(false);
+      await win.unmaximize();
+      await win.setSize(new LogicalSize(DEFAULT_WINDOW.width, DEFAULT_WINDOW.height));
+    }
+    await win.setResizable(!locked);
+    await win.setMaximizable(!locked);
+    if (!locked && windowBeforeLock) {
+      // Put the window back the way it was.
+      const before = windowBeforeLock;
+      windowBeforeLock = null;
+      await win.setSize(before.size);
+      if (before.maximized) await win.maximize();
+      if (before.fullscreen) await win.setFullscreen(true);
+    }
+  },
   async notify(title, body) {
     // The OS remembers the answer, so the permission prompt appears at most once.
     const granted = (await isPermissionGranted()) || (await requestPermission()) === "granted";
@@ -401,6 +426,11 @@ export const setWindowTitle = (title: string) => call("setWindowTitle", title);
 export const isWindowFocused = () => call("isWindowFocused");
 /** Scale the whole interface: 1 is normal size. */
 export const setZoom = (scale: number) => call("setZoom", scale);
+/**
+ * Locked: the window goes to its default size and can be neither resized nor maximized. Unlocked:
+ * it gets its previous size and state back.
+ */
+export const lockWindowSize = (locked: boolean) => call("lockWindowSize", locked);
 
 export const pickFiles = () => call("pickFiles");
 export const pickSavePath = (defaultName: string) => call("pickSavePath", defaultName);
