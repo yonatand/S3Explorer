@@ -32,6 +32,7 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Connect** with an AWS profile from `~/.aws`, or with access keys. A custom endpoint makes it work with MinIO, Cloudflare R2, SeaweedFS, LocalStack and friends.
 - **List buckets**, including buckets in other regions. A bucket shared with you from another account can be added by name, `s3://` address or ARN (the "+" above the bucket list) and used like any other.
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
+- **Search a bucket.** Type in the toolbar and press Enter: words, `"a phrase"`, `-not`, `tag:key=value` and a `folder/part` path all combine, over the current folder or the whole bucket. Folders and objects both show up, you can paste a full path or an `s3://` address to jump straight to it, and the results can be downloaded, deleted, tagged or moved like any other rows. S3 has no search of its own, so this is a bounded scan that tells you when it stopped early.
 - **Download in parallel parts.** Large objects are split into byte ranges and fetched over several connections at once.
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
 - **Whole folders in and out.** Upload a folder (or drop one from your desktop) and download folders into a directory. You see how many files, how much data and what already exists before anything moves; existing files are skipped unless you choose Overwrite; file names are made safe for your disk and a transfer never writes outside the folder you chose.
@@ -41,11 +42,11 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Restore archived objects** from Glacier and Deep Archive, one at a time or many as a background job, with the retrieval tier and how long the restored copy stays. Archived objects show their restore state, and actions that need the data are disabled until it is back.
 - **Tags** on objects and buckets: view, edit, and change them on many objects at once.
 - **Lifecycle rules** with the full S3 model: filters by prefix, tags and size; moves to colder storage; expiration; noncurrent-version actions; cleanup of incomplete uploads. Every rule is summarised in plain language and every rule that deletes data is marked before you save.
-- **Activity panel** for transfers and file operations: live speed, parts, time remaining, cancel, a list of anything that failed, and "show in folder".
+- **Activity panel** for transfers and file operations: live speed, parts, time remaining, cancel, a list of anything that failed. Right-click any row to open the downloaded file or folder, show it in your file manager, jump to the object in the bucket, or copy its key, local path or failures.
 - **Saved connections.** Keep an AWS profile or access keys under a name and connect with one click. Secret keys live in your operating system's keychain, never in a file.
 - **Newest files** of the open bucket in the sidebar, wherever they are, filtered by age, type or search.
 - **Desktop notifications** when a transfer or operation finishes while the app is in the background.
-- **Settings** for part size, parallel parts per transfer and simultaneous transfers, with a live estimate of connections and memory before you save.
+- **Settings** for part size, parallel parts per transfer and simultaneous transfers, with a live estimate of connections and memory before you save. "Show in folder" can open a file manager of your choice instead of the system one.
 - **Light, dark or system theme**, four accent colours, and size and text-weight sliders.
 - **Updates from inside the app.** Check for a new version, read its patch notes, install it. Only updates signed by this project are installed.
 
@@ -151,6 +152,7 @@ S3 Explorer only does what your credentials allow. It needs no permissions outsi
 | See the list of buckets | `ListBuckets` | `s3:ListAllMyBuckets` on `*` |
 | Open a bucket and browse folders | `HeadBucket` (to find the bucket's region), `ListObjectsV2` | `s3:ListBucket` on the bucket |
 | See object details, download | `HeadObject`, `GetObject` | `s3:GetObject` on the objects |
+| Search a bucket | `ListObjectsV2`; `HeadObject` for a pasted path; `GetObjectTagging` for `tag:` terms | `s3:ListBucket` on the bucket; `s3:GetObject` and `s3:GetObjectTagging` on the objects for those two cases |
 | Upload, create a folder | `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` | `s3:PutObject` and `s3:AbortMultipartUpload` on the objects |
 | Delete objects and folders | `ListObjectsV2`, `DeleteObjects` | `s3:ListBucket` on the bucket, `s3:DeleteObject` on the objects |
 | Copy | `ListObjectsV2`, `HeadObject`, `CopyObject`; for objects over 5 GiB `CreateMultipartUpload`, `UploadPartCopy`, `CompleteMultipartUpload`, `GetObjectTagging` | `s3:ListBucket` and `s3:GetObject` on the source; `s3:ListBucket`, `s3:GetObject` and `s3:PutObject` on the destination (the app checks what already exists there and confirms each copy before a move deletes anything) |
@@ -221,7 +223,7 @@ Replace `my-bucket` with your bucket name. Add more buckets by adding their ARNs
 
 ### Read-only
 
-Browse and download, nothing else. Upload, new folder, delete, rename, copy, move, tag editing and lifecycle rules will fail with "Access Denied", which is the point.
+Browse, search and download, nothing else (searching by tag also needs `s3:GetObjectTagging`). Upload, new folder, delete, rename, copy, move, tag editing and lifecycle rules will fail with "Access Denied", which is the point.
 
 ```json
 {
@@ -254,15 +256,13 @@ Browse and download, nothing else. Upload, new folder, delete, rename, copy, mov
 - **Versioned buckets.** Seeing and restoring versions needs `s3:ListBucketVersions` and `s3:GetObjectVersion`. `s3:DeleteObjectVersion` is the one permission in this app that allows an unrecoverable action; leave it out if you only want versions to be a safety net.
 - **Archived objects.** Restoring needs `s3:RestoreObject`, and AWS bills each restore.
 - **KMS-encrypted buckets (SSE-KMS).** Downloads need `kms:Decrypt` and uploads and copies need `kms:GenerateDataKey` on the bucket's KMS key. S3 calls KMS on your behalf; the app itself does not.
-- **Versioned buckets.** Deleting adds a delete marker and older versions stay. The app never deletes specific versions, so it does not need `s3:DeleteObjectVersion`.
-- **Archived objects (Glacier, Deep Archive).** They can be listed but not downloaded or copied until restored. The app does not restore objects.
 - **Other S3-compatible storage** (MinIO, Cloudflare R2, SeaweedFS and others) has its own permission model. The table of calls above tells you what the app will ask the server to do.
 
 The app remembers no more than it must: saved connections keep the secret key in your operating system's keychain, and an AWS profile is read from `~/.aws` each time you connect.
 
 ## Should you trust it?
 
-Honest status, as of `v0.5.1`:
+Honest status, as of `v0.6.0`:
 
 | | |
 |---|---|
@@ -272,7 +272,7 @@ Honest status, as of `v0.5.1`:
 | Independent AI code review of the delete, move and download code, with every finding fixed | yes |
 | Builds and packages in CI for Windows, macOS and Linux | yes |
 | Used against real AWS S3 by the author (browsing, transfers, and the v0.3.0 features) | yes |
-| Shared buckets, tags, lifecycle rules, folder transfers and versions tested against real AWS S3 | **not yet** |
+| Shared buckets, tags, lifecycle rules, folder transfers, versions and search tested against real AWS S3 | **not yet** |
 | Restoring from Glacier tested against a server that supports it (the local test server does not) | **unit tests only** |
 | Lifecycle storage-class transitions tested against any server (the local test server refuses them) | **unit tests only** |
 | In-app update installed for real on any platform | **not yet** |
@@ -287,6 +287,7 @@ Some things were done carefully because this tool can delete data and write to y
 - Lifecycle configurations are never saved over one that changed since you loaded it, and every data-deleting rule is called out before you save.
 - File names coming from S3 are sanitized before they become local paths, so a hostile key can't write outside the folder you picked.
 - The webview runs under a restrictive content security policy and all S3 traffic goes through the Rust side.
+- "Open file" opens only a file this app finished downloading, never a program, and a file manager you configure is started directly with the path as one argument, never through a shell.
 
 Still: it is young, AI-written software. Try it on a bucket you can afford to lose before trusting it with one you can't, and prefer credentials that only have the permissions you need.
 
@@ -315,6 +316,7 @@ cargo run --example tags    # tags and bulk tag jobs
 cargo run --example lifecycle  # lifecycle rules: round trips, conflicts, server refusals
 cargo run --example batches    # folder transfers: round trips, skip/overwrite, collisions, cancel
 cargo run --example versions   # versions and restores against a versioned bucket
+cargo run --example search     # bucket search: terms, tags, paths, folders, caps, cancellation
 ```
 
 `npm run build` type-checks and bundles the frontend.

@@ -1,6 +1,6 @@
 [package]
 name = "s3explorer"
-version = "0.5.1"
+version = "0.6.0"
 description = "Fast cross-platform S3 explorer"
 authors = ["s3explorer"]
 edition = "2021"

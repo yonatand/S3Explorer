@@ -5,9 +5,11 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-08
+
 ### New
 
-- **Search in a bucket.** Type in the toolbar box and press Enter: words, `"a phrase"`, `-not`, `tag:key=value` or `tag:key`, and a `folder/part` path all work together. Search the current folder or the whole bucket, open a result in its folder, or download it from the result list. Searches are bounded (50,000 objects, 2,000 tag lookups) and say so when they stop early.
+- **Search in a bucket.** Type in the toolbar box and press Enter: words, `"a phrase"`, `-not`, `tag:key=value` or `tag:key`, and a `folder/part` path all work together. Search the current folder or the whole bucket. Folders and objects both come up; paste a full path or an `s3://` address and the exact match comes first. Select results and download, delete, copy, cut, rename or tag them as you would in the table, or press Enter to jump to one. Searches are bounded (50,000 objects, 2,000 tag lookups) and say so when they stop early.
 - **Right-click an Activity row.** Downloads offer Open file, Show in folder, Go to object and Copy key / local path; folder transfers Open folder; jobs Copy failures; everything can be cancelled or removed from the menu, with the keyboard too.
 - **Choose your file manager.** Settings → Behavior can point "Show in folder" and "Open folder" at a program of your choice (Total Commander, Files, Dolphin, …) with `{path}` and `{dir}` placeholders, and try it before saving.
 - **A hidden game.** Click a server on the start screen five times: your first connection moves to the middle and the servers defend it against bugs, power surges, worms, ransomware and a DDoS boss. Esc leaves.
