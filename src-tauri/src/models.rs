@@ -284,7 +284,7 @@ impl AccentColor {
 /// Parsing goes through [`AppSettings::from_json_lenient`] (the on-disk file) or
 /// [`AppSettings::from_json_strict`] (the `update_settings` argument); range checks are done by
 /// [`AppSettings::validate`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     #[serde(default)]
@@ -310,7 +310,14 @@ pub struct AppSettings {
     /// Show the Copy/Move confirmation even when the preview found no conflicts.
     #[serde(default = "default_confirm_copy_move")]
     pub confirm_copy_move: bool,
+    /// v0.6.0: the program "Show in folder" / "Open folder" run instead of the system file
+    /// manager (see `file_manager.rs`); `None` = the system file manager.
+    #[serde(default)]
+    pub file_manager_command: Option<String>,
 }
+
+/// Longest accepted `fileManagerCommand`, in characters.
+pub const FILE_MANAGER_COMMAND_MAX: usize = 1024;
 
 pub const TEXT_SIZE_MIN: u32 = 80;
 pub const TEXT_SIZE_MAX: u32 = 150;
@@ -359,6 +366,7 @@ impl Default for AppSettings {
             text_weight: DEFAULT_TEXT_WEIGHT,
             accent: AccentColor::Yellow,
             confirm_copy_move: default_confirm_copy_move(),
+            file_manager_command: None,
         }
     }
 }
@@ -405,6 +413,22 @@ fn text_weight_error() -> crate::error::AppError {
 
 fn confirm_copy_move_error() -> crate::error::AppError {
     crate::error::AppError::invalid("confirmCopyMove must be true or false")
+}
+
+fn file_manager_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "fileManagerCommand must be null or one line of at most {FILE_MANAGER_COMMAND_MAX} characters without control characters"
+    ))
+}
+
+/// `fileManagerCommand` normalized: trimmed, empty -> `None`; `InvalidInput` (naming the field)
+/// when too long or when it holds a control character.
+pub fn normalize_file_manager_command(v: Option<&str>) -> crate::error::AppResult<Option<String>> {
+    let Some(t) = v.map(str::trim).filter(|t| !t.is_empty()) else { return Ok(None) };
+    if t.chars().count() > FILE_MANAGER_COMMAND_MAX || t.chars().any(char::is_control) {
+        return Err(file_manager_error());
+    }
+    Ok(Some(t.to_string()))
 }
 
 fn accent_error() -> crate::error::AppError {
@@ -455,6 +479,9 @@ impl AppSettings {
         if !text_weight_ok(self.text_weight) {
             return Err(text_weight_error());
         }
+        if normalize_file_manager_command(self.file_manager_command.as_deref())? != self.file_manager_command {
+            return Err(file_manager_error());
+        }
         Ok(())
     }
 
@@ -475,6 +502,7 @@ impl AppSettings {
             },
             text_size: if text_size_ok(self.text_size) { self.text_size } else { d.text_size },
             text_weight: if text_weight_ok(self.text_weight) { self.text_weight } else { d.text_weight },
+            file_manager_command: normalize_file_manager_command(self.file_manager_command.as_deref()).unwrap_or(None),
             ..self
         }
     }
@@ -527,10 +555,15 @@ impl AppSettings {
                 .get("confirmCopyMove")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(d.confirm_copy_move),
+            file_manager_command: obj
+                .get("fileManagerCommand")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|c| normalize_file_manager_command(Some(c)).ok().flatten()),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all ten fields must be present. Transfer
+    /// Strict parse of the `update_settings` argument: all eleven fields must be present
+    /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`). Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
     /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
     /// `notifyOnFinish` and `confirmCopyMove` booleans. Anything else is
@@ -574,6 +607,13 @@ impl AppSettings {
                 .get("confirmCopyMove")
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(confirm_copy_move_error)?,
+            file_manager_command: match obj.get("fileManagerCommand") {
+                Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(c)) => {
+                    normalize_file_manager_command(Some(c))?
+                }
+                _ => return Err(file_manager_error()),
+            },
         };
         s.validate()?;
         Ok(s)
@@ -1090,6 +1130,89 @@ pub struct RestoreStatus {
     pub in_progress: bool,
     /// ISO-8601 when the restored copy expires (only once the restore finished).
     pub expires_at: Option<String>,
+}
+
+// ---- v0.6.0: search in a bucket ------------------------------------------------------------
+
+/// `search_objects` stops after looking at this many keys (folder markers are not counted).
+pub const SEARCH_MAX_SCAN: u64 = 50_000;
+/// `search_objects` makes at most this many `GetObjectTagging` calls.
+pub const SEARCH_MAX_TAG_LOOKUPS: u64 = 2_000;
+/// `search_objects` lists at most this many `ListObjectsV2` pages (a bucket of folder markers).
+pub const SEARCH_MAX_PAGES: u64 = 200;
+/// Inclusive range of `SearchQuery.limit`.
+pub const SEARCH_LIMIT_MIN: i64 = 1;
+pub const SEARCH_LIMIT_MAX: i64 = 1000;
+/// `GetObjectTagging` calls in flight at once.
+pub const SEARCH_TAG_PARALLELISM: usize = 16;
+
+/// `SearchQuery` in `types.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchQuery {
+    pub bucket: String,
+    /// Prefix to search under; "" = the whole bucket.
+    pub scope: String,
+    /// The query as typed.
+    pub text: String,
+    /// Max hits, 1..=1000.
+    pub limit: i64,
+}
+
+/// `tag:key=value` (`value: Some`) or `tag:key` (`value: None`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTagTerm {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+/// `ParsedSearch` in `types.ts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedSearch {
+    /// Includes path terms; lowercased.
+    pub words: Vec<String>,
+    pub phrases: Vec<String>,
+    pub excluded: Vec<String>,
+    pub tags: Vec<SearchTagTerm>,
+    /// The whole query when it is one unquoted path term, exactly as typed.
+    pub exact_path: Option<String>,
+    /// The prefix the scan listed.
+    pub list_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub kind: SearchHitKind,
+    /// Set for `kind: "object"`.
+    pub entry: Option<ObjectEntry>,
+    /// Set for `kind: "folder"`; the prefix is passed through byte-for-byte.
+    pub folder: Option<FolderEntry>,
+    /// Objects only, and only when the query has tag terms.
+    pub tags: Option<Vec<Tag>>,
+    /// The exact-path hit (an object headed, or a folder listed, from `exact_path`).
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchHitKind {
+    Object,
+    Folder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    /// The exact hit first (if any), then in key order.
+    pub hits: Vec<SearchHit>,
+    pub scanned: u64,
+    pub tag_lookups: u64,
+    pub truncated: bool,
+    pub reason: Option<String>,
+    pub parsed: ParsedSearch,
 }
 
 #[cfg(test)]

@@ -9,13 +9,16 @@ pub mod batches;
 pub mod buckets;
 pub mod commands;
 pub mod error;
+pub mod file_manager;
 pub mod jobs;
 pub mod keychain;
 pub mod lifecycle;
+pub mod local_open;
 pub mod models;
 pub mod ops;
 pub mod profiles;
 pub mod saved;
+pub mod search;
 pub mod settings;
 pub mod state;
 pub mod tags;
@@ -155,6 +158,11 @@ pub fn run() {
             commands::versions::restore_object_version,
             commands::versions::delete_object_version,
             commands::versions::restore_object,
+            commands::search::search_objects,
+            commands::search::cancel_search,
+            commands::transfers::open_local,
+            commands::transfers::reveal_local,
+            commands::transfers::try_file_manager,
         ])
         .run(context)
         .expect("error while running tauri application");

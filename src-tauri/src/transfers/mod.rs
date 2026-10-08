@@ -253,13 +253,13 @@ impl TransferManager {
 
     /// The settings new transfers will snapshot.
     pub fn settings(&self) -> TransferSettings {
-        *self.settings.lock().unwrap_or_else(|p| p.into_inner())
+        self.settings.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Applies new settings. Part size / parts in flight affect transfers that start running
     /// from now on; the transfer limit applies to the queue immediately. Callers validate first.
     pub fn apply_settings(&self, settings: &TransferSettings) {
-        *self.settings.lock().unwrap_or_else(|p| p.into_inner()) = *settings;
+        *self.settings.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
         self.running.set_limit(settings.max_concurrent_transfers as usize);
     }
 

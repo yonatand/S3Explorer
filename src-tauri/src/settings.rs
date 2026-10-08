@@ -82,7 +82,7 @@ impl SettingsStore {
     }
 
     pub fn get(&self) -> AppSettings {
-        *self.current.lock().unwrap_or_else(|p| p.into_inner())
+        self.current.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Validates, persists, then swaps the in-memory value and calls `apply` with it (all under one
@@ -96,9 +96,10 @@ impl SettingsStore {
         settings.validate()?;
         let _guard = self.update_lock.lock().await;
         if let Some(path) = self.path.clone() {
-            tokio::task::spawn_blocking(move || save(&path, &settings)).await??;
+            let to_save = settings.clone();
+            tokio::task::spawn_blocking(move || save(&path, &to_save)).await??;
         }
-        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = settings;
+        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
         apply(&settings);
         Ok(settings)
     }
@@ -136,7 +137,7 @@ mod tests {
         let d = AppSettings::default();
         assert_eq!(d, s(None, 8, 4));
         assert_eq!(
-            serde_json::to_value(d).expect("ser"),
+            serde_json::to_value(&d).expect("ser"),
             json!({
                 "partSizeMib": null,
                 "maxConcurrentParts": 8,
@@ -147,7 +148,8 @@ mod tests {
                 "textSize": 100,
                 "textWeight": 400,
                 "accent": "yellow",
-                "confirmCopyMove": true
+                "confirmCopyMove": true,
+                "fileManagerCommand": null
             })
         );
         assert!(d.validate().is_ok());
@@ -189,6 +191,7 @@ mod tests {
         o.entry("textWeight").or_insert(json!(400));
         o.entry("accent").or_insert(json!("yellow"));
         o.entry("confirmCopyMove").or_insert(json!(true));
+        o.entry("fileManagerCommand").or_insert(serde_json::Value::Null);
         v
     }
 
@@ -229,7 +232,7 @@ mod tests {
     #[test]
     fn strict_parse_theme_and_update_flag() {
         let base =
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true});
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -317,6 +320,59 @@ mod tests {
     }
 
     #[test]
+    fn file_manager_command() {
+        let with = |value: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match value {
+                Some(value) => o.insert("fileManagerCommand".into(), value),
+                None => o.remove("fileManagerCommand"),
+            };
+            v
+        };
+        assert_eq!(AppSettings::default().file_manager_command, None);
+        let cmd = r#""C:\Program Files\totalcmd\TOTALCMD64.EXE" /O /T "{dir}""#;
+        for (value, expected) in [
+            (json!(cmd), Some(cmd.to_string())),
+            (json!(format!("  {cmd}\t ")), Some(cmd.to_string())),
+            (json!("   "), None),
+            (json!(""), None),
+            (serde_json::Value::Null, None),
+            (json!("x".repeat(1024)), Some("x".repeat(1024))),
+            (json!("ü".repeat(1024)), Some("ü".repeat(1024))),
+        ] {
+            let got = AppSettings::from_json_strict(&with(Some(value.clone()))).expect("valid");
+            assert_eq!(got.file_manager_command, expected, "{value}");
+            assert_eq!(AppSettings::from_json_lenient(&with(Some(value.clone()))).file_manager_command, expected, "{value}");
+        }
+        // update_settings requires it; the on-disk file without it loads null.
+        assert!(AppSettings::from_json_strict(&with(None)).expect_err("missing").message.starts_with("fileManagerCommand"));
+        assert_eq!(AppSettings::from_json_lenient(&with(None)).file_manager_command, None);
+        for bad in [json!("x".repeat(1025)), json!("a\nb"), json!("a\u{0}b"), json!("a\u{7f}"), json!(1), json!(true)] {
+            let v = with(Some(bad.clone()));
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with("fileManagerCommand"), "{bad} -> {}", e.message);
+            // Leniently: only this field falls back.
+            assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{bad}");
+        }
+        // validate() (the in-memory update path) refuses what the strict parse refuses.
+        let bad = AppSettings { file_manager_command: Some("a\u{1b}b".into()), ..AppSettings::default() };
+        assert!(bad.validate().is_err());
+        let untrimmed = AppSettings { file_manager_command: Some(" x ".into()), ..AppSettings::default() };
+        assert!(untrimmed.validate().is_err(), "the stored value is always normalized");
+        assert_eq!(untrimmed.sanitized().file_manager_command.as_deref(), Some("x"));
+        // Round trip through the file.
+        let dir = temp_dir("file-manager");
+        let path = dir.join(SETTINGS_FILE);
+        let saved = AppSettings { file_manager_command: Some(cmd.into()), ..AppSettings::default() };
+        save(&path, &saved).expect("save");
+        assert!(std::fs::read_to_string(&path).expect("read").contains("\"fileManagerCommand\""));
+        assert_eq!(load(&path), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn confirm_copy_move_flag() {
         let with = |flag: Option<serde_json::Value>| {
             let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
@@ -382,6 +438,7 @@ mod tests {
                 text_weight: 500,
                 accent: AccentColor::Blue,
                 confirm_copy_move: true,
+                file_manager_command: None,
             }
         );
         // Saved again, the file carries the new field.
@@ -436,6 +493,7 @@ mod tests {
                 text_weight: 400,
                 accent: AccentColor::Yellow,
                 confirm_copy_move: true,
+                file_manager_command: None,
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
@@ -463,6 +521,7 @@ mod tests {
                     text_weight: 400,
                     accent: AccentColor::Yellow,
                     confirm_copy_move: true,
+                    file_manager_command: None,
                 },
             ),
             // Non-boolean flag: only the flag falls back.
@@ -554,8 +613,8 @@ mod tests {
 
         let mut applied = None;
         let v = s(Some(4), 3, 1);
-        assert_eq!(store.update(v, |x| applied = Some(*x)).await.expect("update"), v);
-        assert_eq!(applied, Some(v));
+        assert_eq!(store.update(v.clone(), |x| applied = Some(x.clone())).await.expect("update"), v);
+        assert_eq!(applied, Some(v.clone()));
         assert_eq!(store.get(), v);
         assert_eq!(SettingsStore::load(path.clone()).get(), v, "reloaded from disk");
 

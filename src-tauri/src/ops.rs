@@ -77,7 +77,7 @@ pub async fn list_objects(
     Ok(ListPage { folders, objects, is_truncated: next.is_some(), next_continuation_token: next })
 }
 
-fn object_entry(o: &aws_sdk_s3::types::Object, key: &str) -> ObjectEntry {
+pub(crate) fn object_entry(o: &aws_sdk_s3::types::Object, key: &str) -> ObjectEntry {
     ObjectEntry {
         key: key.to_string(),
         name: last_segment(key),

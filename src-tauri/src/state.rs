@@ -15,6 +15,7 @@ use crate::error::{is_access_denied, raw_status_and_region, AppError, AppResult}
 use crate::batches::{BatchManager, BatchSink};
 use crate::jobs::{JobManager, JobSink};
 use crate::models::{AppSettings, ConnectionConfig, ConnectionInfo};
+use crate::search::SearchRegistry;
 use crate::settings::SettingsStore;
 use crate::transfers::{ProgressSink, TransferManager};
 
@@ -215,6 +216,8 @@ pub struct AppState {
     pub transfers: Arc<TransferManager>,
     pub jobs: Arc<JobManager>,
     pub batches: Arc<BatchManager>,
+    /// Running `search_objects` calls by `searchId`.
+    pub searches: SearchRegistry,
     pub settings: SettingsStore,
 }
 
@@ -228,7 +231,14 @@ impl AppState {
     ) -> Self {
         let transfers = TransferManager::with_settings(sink, settings.get());
         let batches = BatchManager::new(transfers.clone(), batch_sink);
-        Self { connection: RwLock::new(None), transfers, jobs: JobManager::new(job_sink), batches, settings }
+        Self {
+            connection: RwLock::new(None),
+            transfers,
+            jobs: JobManager::new(job_sink),
+            batches,
+            searches: SearchRegistry::new(),
+            settings,
+        }
     }
 
     pub fn get_settings(&self) -> AppSettings {
@@ -263,8 +273,12 @@ impl AppState {
         unfinished
     }
 
+    /// Replacing or dropping the connection cancels running searches (they belong to the old one).
     pub async fn set_connection(&self, conn: Option<Arc<Connection>>) {
+        self.searches.cancel_all();
         *self.connection.write().await = conn;
+        // Again once the lock is released: a search that started while the write waited holds the old client.
+        self.searches.cancel_all();
     }
 
     pub async fn connection(&self) -> AppResult<Arc<Connection>> {
@@ -342,6 +356,34 @@ mod tests {
     }
 
     const NO_BUCKETS: &str = "<ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>";
+
+    /// A search that starts while `set_connection` waits for the write lock (it already ran its
+    /// first cancel) must still be cancelled: it would otherwise keep the old connection's client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_connection_cancels_a_search_started_while_it_waited() {
+        let sink: Arc<dyn ProgressSink> = Arc::new(|_: &crate::models::Transfer| {});
+        let job_sink: Arc<dyn JobSink> = Arc::new(|_: &crate::models::Job| {});
+        let batch_sink: Arc<dyn BatchSink> = Arc::new(|_: &crate::models::Batch| {});
+        let state = Arc::new(AppState::new(sink, job_sink, batch_sink, SettingsStore::in_memory(Default::default())));
+        let reader = state.connection.read().await; // holds off the write
+        let setter = tokio::spawn({
+            let s = state.clone();
+            async move { s.set_connection(None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await; // the first cancel has run, the write waits
+        assert!(!setter.is_finished());
+        let search = tokio::spawn({
+            let s = state.clone();
+            async move { s.searches.run("late", std::future::pending::<AppResult<()>>()).await }
+        });
+        while state.searches.running() == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(reader);
+        setter.await.expect("join");
+        let r = tokio::time::timeout(Duration::from_secs(5), search).await.expect("the search ended").expect("join");
+        assert!(r.unwrap_err().is_cancelled());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_with_cancel_active_waits_for_every_final_event() {

@@ -54,3 +54,55 @@ pub async fn remove_transfer(state: State<'_, AppState>, id: String) -> AppResul
 pub async fn list_transfers(state: State<'_, AppState>) -> AppResult<Vec<Transfer>> {
     Ok(state.transfers.list())
 }
+
+/// Opens a finished download: a file with its default application, a folder in the file manager
+/// (the `fileManagerCommand` override when set); see [`crate::local_open::resolve`] for what is
+/// accepted.
+#[tauri::command]
+pub async fn open_local(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let (transfers, batches) = (state.transfers.list(), state.batches.list());
+    let command = state.get_settings().file_manager_command;
+    // Checking and opening both touch the file system and the shell: a blocking thread, never the runtime.
+    tokio::task::spawn_blocking(move || {
+        let real = crate::local_open::resolve(&path, &transfers, &batches)?;
+        if let (true, Some(command)) = (real.is_dir(), command.as_deref()) {
+            return crate::file_manager::launch(command, &real);
+        }
+        app.opener()
+            .open_path(real.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|e| AppError::new(crate::error::ErrorCode::Io, format!("Could not open {}: {e}", real.display())))
+    })
+    .await?
+}
+
+/// Shows `path` in the file manager: the system one (with the item selected) when `command` is
+/// `None`, otherwise that program. Blocking.
+fn reveal_with(app: &tauri::AppHandle, command: Option<&str>, path: &str) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let p = std::path::Path::new(path);
+    if path.trim().is_empty() || !p.is_absolute() {
+        return Err(AppError::invalid(format!("An absolute local path is required: {path}")));
+    }
+    match command {
+        Some(command) => crate::file_manager::launch(command, p),
+        None => app
+            .opener()
+            .reveal_item_in_dir(p)
+            .map_err(|e| AppError::new(crate::error::ErrorCode::Io, format!("Could not show {path}: {e}"))),
+    }
+}
+
+/// "Show in folder": the saved `fileManagerCommand`, or the system file manager.
+#[tauri::command]
+pub async fn reveal_local(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> AppResult<()> {
+    let command = state.get_settings().file_manager_command;
+    tokio::task::spawn_blocking(move || reveal_with(&app, command.as_deref(), &path)).await?
+}
+
+/// Like [`reveal_local`] with an unsaved command (the Settings "Try it" button).
+#[tauri::command]
+pub async fn try_file_manager(app: tauri::AppHandle, command: Option<String>, path: String) -> AppResult<()> {
+    let command = crate::models::normalize_file_manager_command(command.as_deref())?;
+    tokio::task::spawn_blocking(move || reveal_with(&app, command.as_deref(), &path)).await?
+}
