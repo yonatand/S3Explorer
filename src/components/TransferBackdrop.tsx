@@ -207,6 +207,9 @@ function useTileBoxes(): { tiles: TileBox[]; list: ListBox | null } {
     // every change is measured at once and again when things have settled.
     let settle = 0;
     const measureNowAndSettled = () => {
+      // While a game runs it rewrites its HUD every frame: measuring the page on each of those changes
+      // forced a layout per frame behind the game. The tiles are hidden then anyway.
+      if (document.documentElement.classList.contains("playing-game")) return;
       measure();
       window.clearTimeout(settle);
       settle = window.setTimeout(measure, SETTLE_MS);
