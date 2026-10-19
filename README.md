@@ -36,7 +36,7 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Folder sizes on demand.** Calculate how many objects and bytes a folder (or several) holds. S3 keeps no folder totals, so this is a cancellable scan that stops at 200,000 keys and says "at least" when it does.
 - **Search a bucket.** Press `Ctrl+F` (or `/`, or `Alt+F7`), start typing in the search row under the toolbar, and results appear as you type: words, `"a phrase"`, `-not`, `tag:key=value` and a `folder/part` path all combine, over the current folder or the whole bucket. Folders and objects both show up, you can paste a full path or an `s3://` address to jump straight to it, and the results can be downloaded, deleted, tagged or moved like any other rows. S3 has no search of its own, so this is a bounded scan that tells you when it stopped early.
 - **Two panes.** Split the window into two explorer panes, each on its own folder or bucket, and copy or move between them by dragging rows across, with `F5` / `F6` (or `Ctrl+Shift+C` / `Ctrl+Shift+X`), or from the right-click menu. Same previews and confirmations as everywhere else. `Ctrl+Shift+Right` / `Ctrl+Shift+Left` make the other pane show the same place as this one.
-- **Your computer in a pane.** `Alt+F1` / `Alt+F2` (or "This computer" in the sidebar) turn either pane into a view of a drive or folder on your machine. Copy from a bucket into it to download, from it into a bucket to upload; Move then removes only the originals that finished transferring. New folder, rename, folder sizes and delete work there too, and a local delete always goes to the recycle bin.
+- **Your computer in a pane.** `Alt+F1` / `Alt+F2` (or "This computer" in the sidebar) turn either pane into a view of a drive or folder on your machine. Copy from a bucket into it to download, from it into a bucket to upload; Move then removes only the originals that finished transferring. New folder, rename, folder sizes and delete work there too, and a local delete always goes to the recycle bin. Network locations work as well: pick a saved Network Location or a mapped drive, or type a `\\server\share` path; the app never deletes anything on a share (shares have no recycle bin), so a move from a share to a bucket uploads and leaves the files where they are.
 - **Edit the path.** `Ctrl+L` turns the path bar into a text field: paste an `s3://` address or a local path and press Enter.
 - **Tabs** in each pane. Middle-click a folder or press `Ctrl+T` or `Ctrl+N` for a new tab, `Ctrl+W` to close one, `Ctrl+Tab` to switch and `Ctrl+Shift+T` to bring back the last one you closed. Each tab keeps its own selection, filter, search results and history, and when you had more than one tab open they come back the next time you connect to the same account.
 - **Bookmarks bar.** Star a folder in the path bar (or press `Ctrl+Shift+D`) and it becomes a chip under the toolbar, one click away. Bookmarks are kept per connection and can be renamed and reordered.
@@ -300,7 +300,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.9.0`:
+Honest status, as of `v0.9.1`:
 
 | | |
 |---|---|
@@ -315,6 +315,7 @@ Honest status, as of `v0.9.0`:
 | The v0.8.0 features (tabs, bookmarks, folder sizes, preview, metadata editing, history, speed limits, pause and resume, the update popup) tested against the mock backend and the local S3 server | yes |
 | The same v0.8.0 features tested against real AWS S3 | **not yet** |
 | The v0.9.0 features (Total Commander keys and keeping existing keys, the local computer in a pane, edit path, sync the other pane, the command line, the window icon, type to jump) tested against the mock backend and the local S3 server | yes |
+| Network locations (v0.9.1) tested against a real share | **the owner's own share only** |
 | The same v0.9.0 features tested against real AWS S3 | **not yet** |
 | The local-pane and recycle-bin code on macOS and Linux | **compiled in CI only, never run** |
 | Restoring from Glacier tested against a server that supports it (the local test server does not) | **unit tests only** |
