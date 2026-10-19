@@ -1597,8 +1597,6 @@ function runRaid(
   // God mode (the `iddqd` cheat code): a run that ever had it on never records a best score.
   let god = false;
   let godUsed = false;
-  // Development builds only: the test tools (start floor, F9/F10/F11). A run that used them saves no best score.
-  let testUsed = false;
 
   const inside = (x: number, y: number) => x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1;
   const cellAt = (x: number, y: number): string => (x < 0 || y < 0 || x >= MAP_W || y >= MAP_H ? "#" : map[y][x]);
@@ -3510,14 +3508,6 @@ function runRaid(
         <li><kbd>M</kbd> mute</li>
         <li><kbd>Esc</kbd> pause</li>
       </ul>
-      ${
-        import.meta.env.DEV
-          ? `<div class="raid-test" style="display:grid;gap:6px;justify-items:center;margin:-6px 0 14px;font-size:12px;color:rgba(242,242,243,0.7)">
-        <label>Start on <select data-test-floor style="margin-left:6px;font:inherit">${FLOORS.map((_, i) => `<option value="${i}">Floor ${i + 1} · ${THEMES[i].name}</option>`).join("")}<option value="${FLOORS.length}">Roof</option></select></label>
-        <span>Test keys (dev only): <kbd>F9</kbd> next floor · <kbd>Shift</kbd>+<kbd>F9</kbd> previous · <kbd>F10</kbd> finish the objective · <kbd>F11</kbd> god mode</span>
-      </div>`
-          : ""
-      }
       <button type="button" class="btn btn-primary" data-start>Start the raid</button>
       <p class="raid-best"></p>
     </div>
@@ -3960,7 +3950,6 @@ function runRaid(
     raycaster.intersectObjects(targets, false, hitList);
     const hit = hitList[0];
     guns[weapon].muzzle.getWorldPosition(vA);
-    if (import.meta.env.DEV) (window as unknown as { __lastHit?: unknown }).__lastHit = hit ? [spread.toFixed(4), anim.viewPitch.toFixed(4), anim.viewYaw.toFixed(4), camera.rotation.x.toFixed(4), player.pitch.toFixed(4), hit.distance.toFixed(2), owner.has(hit.object) ? "person" : blockers.includes(hit.object) ? "blocker" : hit.object.type, hit.point.toArray().map((v) => +v.toFixed(2))] : "none";
     addTracer(vA, hit ? hit.point : raycaster.ray.at(60, vB), MY_TRACER);
     if (!hit) return false;
     addSpark(hit.point);
@@ -4812,7 +4801,7 @@ function runRaid(
     );
     const rank = !won ? "C" : score >= 9000 ? "S" : score >= 7000 ? "A" : score >= 5000 ? "B" : "C";
     const best = readBest();
-    if (score > best && !godUsed && !testUsed) {
+    if (score > best && !godUsed) {
       try {
         localStorage.setItem(BEST_KEY, String(score));
       } catch {
@@ -4820,7 +4809,7 @@ function runRaid(
       }
     }
     const time = `${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`;
-    setText(resultsEl.querySelector(".raid-kicker")!, `${testUsed ? "Test run · " : ""}${godUsed ? "God mode · " : ""}${diff.name} · ${won ? "Mission complete" : "Mission failed"}`);
+    setText(resultsEl.querySelector(".raid-kicker")!, `${godUsed ? "God mode · " : ""}${diff.name} · ${won ? "Mission complete" : "Mission failed"}`);
     setText(resultsEl.querySelector("h2")!, won ? "You're out with the secrets." : reason === "Locked down" ? "Locked down." : "Caught.");
     setText(resultsEl.querySelector(".raid-rank b")!, rank);
     setText(resultsEl.querySelector(".raid-rank span")!, `Score ${score}`);
@@ -4838,7 +4827,7 @@ function runRaid(
     resultsEl.querySelector("dl")!.innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("");
     setText(
       resultsEl.querySelector(".raid-best")!,
-      godUsed ? "God mode was on: the best score is not saved." : testUsed ? "Test tools were used: the best score is not saved." : score > best ? "A new best score." : `Best score ${best}`,
+      godUsed ? "God mode was on: the best score is not saved." : score > best ? "A new best score." : `Best score ${best}`,
     );
     resultsEl.classList.add("shown", won ? "won" : "lost");
     lastSummary = `${won ? "Out with the secrets" : reason}: rank ${rank}, score ${score}, ${kills} down, ${accuracy}% accuracy.`;
@@ -5823,10 +5812,6 @@ function runRaid(
     introLine = 0;
     introChars = 0;
     introHold = 0;
-    if (import.meta.env.DEV) {
-      const start = Number(hud.querySelector<HTMLSelectElement>("[data-test-floor]")?.value ?? 0);
-      if (start > 0) testJump(start);
-    }
     // The first floor was built before the difficulty was chosen: Easy has no extra guards.
     if (!DIFFICULTIES[difficulty].extra) {
       for (const g of guards) {
@@ -6304,83 +6289,6 @@ function runRaid(
     if (!godCode(e)) return;
     toggleGod();
   };
-  /** Dev only: jump to a floor (0..4) or the roof (5), with the weapons found below it. */
-  const testJump = (to: number) => {
-    if (loading || ride || restarting) return;
-    testUsed = true;
-    for (const id of WEAPON_IDS) {
-      if (!inv.owned[id]) continue;
-      if (id === "shield") inv.shield = Math.max(inv.shield, WEAPONS.shield.durability);
-      else inv.mag[id] = Math.max(inv.mag[id], WEAPONS[id].magazine);
-      inv.reserve[WEAPONS[id].ammo] = Math.max(inv.reserve[WEAPONS[id].ammo], Math.floor(WEAPONS[id].reserveMax / 2));
-    }
-    keypad = null;
-    trigger = false;
-    sound.alarm(false);
-    resetHands();
-    const roof = to >= FLOORS.length;
-    floorIndex = Math.min(to, LAST);
-    (roof ? loadRoof(placeInCar) : loadFloor(to, true)).then(() => {
-      copyInv(inv, saved);
-      floorClock = 0;
-      showBanner(roof ? "Test: the roof" : `Test: floor ${to + 1}`);
-      if (phase === "play" && !roof) radio(ARRIVE[floorIndex]);
-    }, swallow);
-  };
-  /** Dev only: the current floor's job, done (on the roof, the helicopter comes down now). */
-  const testFinish = () => {
-    testUsed = true;
-    if (onRoof) {
-      if (extract && extract.state === "wait") {
-        roofClock = Math.max(roofClock, roofHold - 2);
-        extract.state = "in";
-        extract.t = 8;
-        sound.helicopter(true, 0.5);
-        if (roofSpot) extract.h.mount.add(roofSpot);
-        if (troop && troop.state === "wait") {
-          troop.state = "gone";
-          troop.h.node.visible = false;
-        }
-      }
-      return;
-    }
-    for (const d of doors) {
-      d.open = d.known = true;
-    }
-    flowFrom = -1;
-    if (floorIndex === 0) for (const s of stations) if (s.kind === "T" && !s.done) completeStation(s);
-    if (floorIndex === 1) {
-      const t = stations.find((s) => s.kind === "T");
-      if (t && !t.done) finishStation(t);
-      run = null;
-      backupT = 0;
-      unlockFloor("Test: access codes downloaded");
-    }
-    if (floorIndex === 2) for (const s of stations) if (s.kind === "F" && !s.done) completeStation(s);
-    if (floorIndex === 3) unlockFloor("Test: badge taken");
-    if (floorIndex === LAST && finale <= 0) {
-      run = null;
-      hasKey = keyDoorOpen = true;
-      startFinale();
-    }
-  };
-  /** Dev only: F9 next floor (Shift: previous, the roof counts), F10 finish the objective, F11 god mode. */
-  const testKeys = (e: KeyboardEvent): boolean => {
-    if (!["F9", "F10", "F11"].includes(e.code)) return false;
-    e.preventDefault();
-    if (e.repeat || (phase !== "play" && phase !== "intro")) return true;
-    if (e.code === "F11") {
-      testUsed = true;
-      toggleGod();
-    } else if (e.code === "F10") {
-      if (phase === "play") testFinish();
-    } else {
-      const at = onRoof ? FLOORS.length : floorIndex;
-      const to = Math.max(0, Math.min(FLOORS.length, at + (e.shiftKey ? -1 : 1)));
-      if (to !== at) testJump(to);
-    }
-    return true;
-  };
   const onKeyDown = (e: KeyboardEvent) => {
     if (!booted) {
       if (e.code === "Escape") onExit();
@@ -6391,7 +6299,6 @@ function runRaid(
       e.preventDefault();
       e.stopPropagation();
     }
-    if (import.meta.env.DEV && testKeys(e)) return;
     cheat(e);
     // The ending can be skipped once it has run a second.
     if (phase === "extract") {
@@ -6587,64 +6494,6 @@ function runRaid(
   host.addEventListener("contextmenu", onContextMenu);
   document.addEventListener("mousemove", onMouseMove);
   document.addEventListener("pointerlockchange", onLockChange);
-  if (import.meta.env.DEV) {
-    // Development only (stripped from the production build): a handle for automated checks.
-    (window as unknown as Record<string, unknown>).__raid = {
-      THREE,
-      renderer,
-      scene,
-      camera,
-      player,
-      inv,
-      get guards() {
-        return guards;
-      },
-      get civs() {
-        return civs;
-      },
-      get phase() {
-        return phase;
-      },
-      get roof() {
-        return { onRoof, roofClock, roofHold, troop: troop?.state, extract: extract?.state };
-      },
-      load: (f: number) => loadFloor(f, true),
-      loadRoof: () => loadRoof(placeInCar),
-      skipRoof: (t: number) => {
-        roofClock = t;
-      },
-      give: (id: WeaponId) => {
-        inv.owned[id] = true;
-        if (id === "shield") inv.shield = WEAPONS.shield.durability;
-        else inv.mag[magKey(id)] = WEAPONS[id].magazine;
-        inv.reserve[WEAPONS[id].ammo] = WEAPONS[id].reserveMax;
-        selectWeapon(id);
-      },
-      fire: () => {
-        targets.length = 0;
-        fire();
-      },
-      god: () => {
-        god = true;
-      },
-      stats: () => ({ shots, hits, headshots }),
-      get input() {
-        return { trigger, locked, phase, busy: busy(), wantWeapon, fireCooldown, weapon };
-      },
-      forceLock: () => {
-        locked = everLocked = true;
-      },
-      aim: (on: boolean) => {
-        adsHeld = on;
-      },
-      trigger: (on: boolean) => {
-        trigger = on;
-        triggerFresh = on;
-      },
-      lastHit: () => (window as unknown as { __lastHit?: unknown }).__lastHit,
-      info: () => ({ draws: renderer.info.render.calls, tris: renderer.info.render.triangles, lights: countLights(), programs: renderer.info.programs?.length, guards: guards.length, civs: civs.length }),
-    };
-  }
   return () => {
     disposed = true;
     cancelAnimationFrame(frame);
@@ -6662,7 +6511,6 @@ function runRaid(
     host.removeEventListener("contextmenu", onContextMenu);
     document.removeEventListener("mousemove", onMouseMove);
     document.removeEventListener("pointerlockchange", onLockChange);
-    if (import.meta.env.DEV) delete (window as unknown as Record<string, unknown>).__raid;
     sound.dispose();
     for (const h of helis) h.dispose();
     for (const d of perFloorDisposables.splice(0)) d.dispose();
