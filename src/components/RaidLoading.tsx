@@ -42,7 +42,7 @@ export function RaidLoadingScreen({ progress, step, plan, built = 0 }: { progres
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < plan[y].length; x++) {
         const ch = plan[y][x];
-        if (ch === "." || "GHBCNI+=K".includes(ch)) {
+        if (ch === "." || "GHBCNI+=KgEArsuJq".includes(ch)) {
           c.fillStyle = "rgba(255, 255, 255, 0.05)";
           c.fillRect(x * s, y * s, s, s);
           continue;
