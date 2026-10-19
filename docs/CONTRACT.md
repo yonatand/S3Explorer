@@ -2395,6 +2395,17 @@ accent's icons are destroyed after the swap. The startup icon is applied from th
 window is shown, so the taskbar never shows the installed icon first when the accent is not yellow. A pinned
 taskbar or Start-menu shortcut still shows the installer's icon (that is Windows reading the shortcut).
 
+**v0.9.2:** the installed build sets an AppUserModelID (needed since v0.4.0 for the taskbar icon), and with an
+ID the taskbar takes the running button's icon from the matching Start-menu shortcut, not from the window, so
+the v0.9.1 fix only worked in dev builds. `set_window_icon` now also writes the accent's icon as an `.ico` file
+(PNG-in-ICO, 32 and 256 px) under the app's config directory (`icons\<accent>.ico`) and sets the main
+window's property store: `System.AppUserModel.RelaunchIconResource` = that file (`"<path>,0"`),
+`System.AppUserModel.RelaunchCommand` = the executable's path, `System.AppUserModel.RelaunchDisplayNameResource`
+= "S3 Explorer" (Windows requires the three together). The taskbar uses the relaunch icon for the running
+button of an app grouped by ID. This is done at startup (before the window shows) and on every accent change,
+after the window and class icons. A shortcut pinned to the taskbar keeps the icon it was pinned with; the app
+never edits shortcuts.
+
 ### IAM permissions added in this version
 
 None.
