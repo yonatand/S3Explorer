@@ -31,7 +31,7 @@ import {
 import { goHistory, navigate, readPref, refresh, setDetailsOpen, setFilter, setSplit, useApp, usePane, usePaneId, writePref } from "../store/app";
 import { isLocalPane, otherPane, usePanes } from "../store/panes";
 import { crossRefusal, locLabel, transferToOtherPane, type Loc } from "../store/cross";
-import { localUp, openLocalNewFolder, requestLocalRename, requestLocalTrash } from "../store/local";
+import { isNetworkPath, localUp, NO_RECYCLE_BIN, openLocalNewFolder, requestLocalRename, requestLocalTrash } from "../store/local";
 import { onPathBarClick, SourceButton } from "./LocalPane";
 import { getSearch, leaveSearch, requestResultsFocus, rerunSearch, runSearch, scheduleSearch, searchScheduled, setSearchScope, usePaneSearch, useSearch } from "../store/search";
 import { focusPaneListSoon, useKeyHint, withKey } from "../store/keyboard";
@@ -299,6 +299,8 @@ export function Toolbar() {
   const bucket = usePane((s) => s.bucket);
   // v0.9.0: the active pane shows this computer. S3-only actions are disabled with the reason.
   const local = usePane((s) => isLocalPane(s));
+  // A network location (v0.9.1): no recycle bin, so Delete is refused with the reason.
+  const onShare = usePane((s) => !!s.local && isNetworkPath(s.local.dir));
   const prefix = usePane((s) => s.prefix);
   const loading = usePane((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
@@ -442,7 +444,7 @@ export function Toolbar() {
                 otherRefused ??
                 (blocked
                   ? ARCHIVED_REASON
-                  : `${withKey("Move to other pane", k.moveOther)}: ${destUri}${local ? " (then to the recycle bin here)" : dest.kind === "local" ? " (then the downloaded objects are deleted from S3)" : ""}`)
+                  : `${withKey("Move to other pane", k.moveOther)}: ${destUri}${local ? (onShare ? " (the files stay on the network location: it has no recycle bin)" : " (then to the recycle bin here)") : dest.kind === "local" ? " (then the downloaded objects are deleted from S3)" : ""}`)
               }
               aria-label="Move to other pane"
             >
@@ -463,9 +465,10 @@ export function Toolbar() {
         )}
         <button
           className="btn btn-danger-ghost"
-          disabled={disabled || selCount === 0}
+          disabled={disabled || selCount === 0 || onShare}
           onClick={() => (local ? requestLocalTrash() : requestDelete())}
-          title={local ? withKey("Move to the recycle bin", k.del) : withKey(selCount > 1 ? `Delete ${selCount} items` : "Delete", k.del)}
+          title={onShare ? NO_RECYCLE_BIN : local ? withKey("Move to the recycle bin", k.del) : withKey(selCount > 1 ? `Delete ${selCount} items` : "Delete", k.del)}
+          data-reason={onShare ? NO_RECYCLE_BIN : undefined}
         >
           <Trash2 size={14} />
           <span className="btn-label secondary">Delete</span>

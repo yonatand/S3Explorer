@@ -24,6 +24,7 @@ import {
   HardDrive,
   Home,
   Loader2,
+  Network,
   PencilLine,
   RefreshCw,
   Trash2,
@@ -40,7 +41,10 @@ import {
   createLocalFolder,
   editablePath,
   goToTypedPath,
+  isNetworkPath,
+  isNetworkRoot,
   localSegments,
+  NO_RECYCLE_BIN,
   openLocalEntry,
   openLocalNewFolder,
   openSourceMenu,
@@ -86,6 +90,7 @@ export const LocalSizeCell = memo(function LocalSizeCell({ path }: { path: strin
 /** The path bar's first control: which source the pane shows; opens the source menu. */
 export function SourceButton({ pane }: { pane: PaneId }) {
   const local = usePane((s) => isLocalPane(s));
+  const onShare = usePane((s) => !!s.local && isNetworkPath(s.local.dir));
   const hint = useKeyHint(pane === "a" ? "source.pickLeft" : "source.pickRight");
   return (
     <button
@@ -100,13 +105,23 @@ export function SourceButton({ pane }: { pane: PaneId }) {
       aria-label="Choose the source of this pane"
       aria-haspopup="menu"
     >
-      {local ? <HardDrive size={13} /> : <Cloud size={13} />}
+      {onShare ? <Network size={13} /> : local ? <HardDrive size={13} /> : <Cloud size={13} />}
       <ChevronDown size={11} className="source-caret" />
     </button>
   );
 }
 
-const rootIcon = (r: LocalRoot) => (r.kind === "home" ? <Home size={14} /> : r.kind === "drive" ? <HardDrive size={14} /> : <FolderOpen size={14} />);
+/** The icon of a local root: home, a network location (saved, or a mapped network drive), a drive, a mount. */
+export const rootIcon = (r: LocalRoot, size = 14, className?: string) =>
+  r.kind === "home" ? (
+    <Home size={size} className={className} />
+  ) : isNetworkRoot(r) ? (
+    <Network size={size} className={className} />
+  ) : r.kind === "drive" ? (
+    <HardDrive size={size} className={className} />
+  ) : (
+    <FolderOpen size={size} className={className} />
+  );
 
 /** The source menu: the local roots first (like Total Commander's drive list), then this connection's buckets. Rendered once (Explorer). */
 export function SourceMenu() {
@@ -223,7 +238,10 @@ export function PathEditField({ pane }: { pane: PaneId }) {
         aria-invalid={!!error}
         aria-describedby={error ? `path-err-${pane}` : undefined}
         placeholder="s3://bucket/folder/  ·  folder/  ·  C:\\Users"
-        disabled={busy}
+        // Read-only (not disabled) while it goes there: a disabled field loses the focus, and Esc
+        // right after an inline error then reached nothing.
+        readOnly={busy}
+        aria-busy={busy}
       />
       {busy && <Loader2 size={13} className="spin path-edit-spin" />}
       {error && (
@@ -261,6 +279,8 @@ export function LocalPathBar() {
   const hiddenKey = useKeyHint("local.toggleHidden");
   const editKey = useKeyHint("nav.editPath");
   const segs = useMemo(() => localSegments(dir), [dir]);
+  // A network location (a UNC path or a mapped network drive) shows a network icon in its first crumb.
+  const onShare = useMemo(() => isNetworkPath(dir), [dir]);
   const selCount = sel.folders + sel.objects;
   return (
     <div className="breadcrumbs local-bar" onClick={onPathBarClick(pane)} title={withKey("Click to type a path", editKey)}>
@@ -275,7 +295,7 @@ export function LocalPathBar() {
               title={s.path}
               data-drop-local={s.path}
             >
-              {i === 0 && <HardDrive size={13} />}
+              {i === 0 && (onShare ? <Network size={13} className="crumb-net" aria-label="Network location" /> : <HardDrive size={13} />)}
               {s.name}
             </button>
           </Fragment>
@@ -364,7 +384,9 @@ export function useLocalMenuGroups(pane: PaneId): MenuItem[][] {
             ? { disabled: true, title: other }
             : sel.some((e) => e.isSymlink)
               ? { title: `${LINK_MOVE} (they are left out)` }
-              : { title: "Upload, then move what was uploaded to the recycle bin" }),
+              : isNetworkPath(dir)
+                ? { title: "Upload only: the files stay on the network location (it has no recycle bin)" }
+                : { title: "Upload, then move what was uploaded to the recycle bin" }),
         },
       ]
     : [];
@@ -405,14 +427,18 @@ export function useLocalMenuGroups(pane: PaneId): MenuItem[][] {
     ...toOther,
     { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openLocalNewFolder(pane), hint: k.newFolder },
   ]);
+  // A network location has no recycle bin: Delete is shown disabled, with the reason.
+  const onShare = isNetworkPath(dir) || sel.some((e) => isNetworkPath(e.path));
   groups.push([
-    {
-      label: sel.length > 1 ? `Move ${sel.length} items to the recycle bin…` : "Move to the recycle bin…",
-      icon: <Trash2 size={14} />,
-      danger: true,
-      action: () => requestLocalTrash(pane),
-      hint: k.del,
-    },
+    onShare
+      ? { label: "Delete", icon: <Trash2 size={14} />, action: () => {}, hint: k.del, disabled: true, title: NO_RECYCLE_BIN }
+      : {
+          label: sel.length > 1 ? `Move ${sel.length} items to the recycle bin…` : "Move to the recycle bin…",
+          icon: <Trash2 size={14} />,
+          danger: true,
+          action: () => requestLocalTrash(pane),
+          hint: k.del,
+        },
   ]);
   return groups;
 }

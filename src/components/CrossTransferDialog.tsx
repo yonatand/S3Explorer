@@ -2,7 +2,7 @@
 // between panes" in docs/CONTRACT.md). Loaded on first use.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { AlertCircle, AlertTriangle, ArrowRight, FolderDown, FolderUp, Loader2 } from "lucide-react";
+import { AlertCircle, AlertTriangle, ArrowRight, FolderDown, FolderUp, Info, Loader2 } from "lucide-react";
 import { formatBytes, s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 import type { BatchPreview, ConflictPolicy } from "../lib/types";
@@ -56,7 +56,9 @@ function CrossTransferBody({ planId, plan }: { planId: number; plan: CrossPlan }
   const [states, retry] = useBatchPreviews(requests, 0);
   const actionRef = useRef<HTMLButtonElement>(null);
   const download = plan.direction === "download";
-  const move = plan.mode === "cut";
+  // A move from a network location (v0.9.1) uploads only: the files stay on the share.
+  const stayOnShare = plan.stayOnShare;
+  const move = plan.mode === "cut" && !stayOnShare;
   const loadingFolders = !!states && states.some((s) => s.status === "loading");
   const folderErrors = states ? states.filter((s) => s.status === "error").length : 0;
   const previewOf = (i: number) => (states?.[i]?.status === "ok" ? (states[i] as { preview: BatchPreview }).preview : null);
@@ -165,6 +167,15 @@ function CrossTransferBody({ planId, plan }: { planId: number; plan: CrossPlan }
       {blocked.length > 0 && <p className="hint err-text">{plural(blocked.length, "item")} can’t go there: the name is taken by {blocked.length === 1 ? "a file or folder" : "files or folders"} of the other kind.</p>}
       {!plan.existing.complete && (
         <p className="hint warn-text">The destination holds more than could be checked; {download ? "files" : "objects"} not seen may be replaced.</p>
+      )}
+      {stayOnShare && (
+        <div className="callout info stay-on-share" role="note">
+          <Info size={14} />
+          <span>
+            <strong>The files stay on the network location.</strong> It has no recycle bin, so moving from it uploads only: nothing on the share is
+            deleted by this app. Once you have checked the upload, delete the files in the file manager.
+          </span>
+        </div>
       )}
       {move && (
         <div className="callout warn" role="note">

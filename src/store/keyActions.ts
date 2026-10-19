@@ -32,6 +32,7 @@ import {
   copyLocalPaths,
   defaultLocalDir,
   localSegments,
+  localTrashRefusal,
   localUp,
   openLocalNewFolder,
   openSourceMenu,
@@ -303,8 +304,12 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "act.delete": () => {
     if (!selection().count) return no(SELECT_FIRST);
     // A local pane: to the recycle bin, after the confirmation.
-    if (local()) requestLocalTrash();
-    else requestDelete();
+    if (local()) {
+      // A network location has no recycle bin: refused with the reason, nothing is deleted.
+      const why = localTrashRefusal();
+      if (why) return no(why);
+      requestLocalTrash();
+    } else requestDelete();
   },
   "act.rename": () => {
     const { count } = selection();

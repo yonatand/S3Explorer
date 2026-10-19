@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, ChevronRight, FolderOpen, HardDrive, Home, Info, MoreHorizontal, Plus, RefreshCw, Search, SquarePlus, Tag, Tags, Users, X } from "lucide-react";
+import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, ChevronRight, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, SquarePlus, Tag, Tags, Users, X } from "lucide-react";
 import { activePane, loadAddedBuckets, loadBuckets, navigate, navigateLocal, openModal, readPref, useApp, usePane, writePref } from "../store/app";
 import { focusComputer, loadLocalRoots, setLocalRootsOpen, useLocalRoots, useLocalRootsOpen } from "../store/local";
 import { focusPaneListSoon } from "../store/keyboard";
@@ -8,6 +8,7 @@ import { formatExact } from "../lib/format";
 import { openFolderInNewTab } from "../store/tabs";
 import { PopupMenu } from "./PopupMenu";
 import { RecentFiles } from "./RecentFiles";
+import { rootIcon } from "./LocalPane";
 import { isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
 
 const SHARE_KEY = "s3x.bucketsShare";
@@ -211,7 +212,7 @@ function LocalRootsGroup() {
                 }
               }}
             >
-              {r.kind === "home" ? <Home size={14} className="bucket-icon" /> : <HardDrive size={14} className="bucket-icon" />}
+              {rootIcon(r, 14, "bucket-icon")}
               <span className="bucket-name">{r.label}</span>
             </div>
           ))}

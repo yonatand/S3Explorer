@@ -18,7 +18,7 @@ import { isBatchActive, onBatchFileFinished, onBatchUpdate, startBatch, useBatch
 import { isActive, onTransferFinished, scheduleTransferResync, useTransfers } from "./transfers";
 import { requestTransferToOther, startConfirmedJob, tooMany, withoutArchived } from "./ops";
 import { useSettings } from "./settings";
-import { dropLocalSizes, sameLocalPath, selectedLocal, trashLocalPaths, typedParent } from "./local";
+import { dropLocalSizes, isNetworkPath, sameLocalPath, selectedLocal, trashLocalPaths, typedParent } from "./local";
 import { getSelected, getSelectionPrefix } from "./view";
 import { toast, toastFailure } from "./toasts";
 
@@ -71,6 +71,11 @@ export interface CrossPlan {
   existing: { files: Set<string>; dirs: Set<string>; complete: boolean };
   /** Upload only: names found by HeadObject when the listing was incomplete. */
   probed?: Set<string>;
+  /**
+   * v0.9.1: a move from a network location (no recycle bin). It uploads only: the files stay on the
+   * share and nothing local is ever trashed (the confirmation says so).
+   */
+  stayOnShare: boolean;
 }
 
 const plans = new Map<number, CrossPlan>();
@@ -177,6 +182,7 @@ export async function requestCross(p: { from: Loc; to: Loc; mode: "copy" | "cut"
     items,
     existing,
     probed,
+    stayOnShare: from.kind === "local" && mode === "cut" && (isNetworkPath(from.dir) || items.some((i) => "path" in i && isNetworkPath(i.path))),
   };
   plans.set(plan.id, plan);
   // A plain copy of files with nothing in the way may start at once ("Ask before copying or moving"
@@ -340,8 +346,9 @@ const doneOf = (direction: PendingMove["direction"], t: Transfer): Done =>
  * conflicting files. A move also registers the delete that follows. Resolves with the count started.
  */
 export async function startPlan(plan: CrossPlan, targets: CrossTarget[], onConflict: ConflictPolicy): Promise<number> {
+  // A move from a network location uploads only: no pending trash is ever registered for it.
   const move: PendingMove | null =
-    plan.mode === "cut"
+    plan.mode === "cut" && !plan.stayOnShare
       ? {
           seq: ++moveSeq,
           direction: plan.direction,
@@ -397,8 +404,11 @@ export async function startPlan(plan: CrossPlan, targets: CrossTarget[], onConfl
   if (started) {
     setTransfersOpen(true);
     scheduleTransferResync();
-    const verb = plan.direction === "download" ? (plan.mode === "cut" ? "Moving" : "Downloading") : plan.mode === "cut" ? "Moving" : "Uploading";
-    toast.info(`${verb} ${plural(started, "item")}`, plan.direction === "download" ? `to ${plan.dir}` : `to ${s3Uri(plan.bucket, plan.prefix)}`);
+    const verb = plan.direction === "download" ? (plan.mode === "cut" ? "Moving" : "Downloading") : plan.mode === "cut" && !plan.stayOnShare ? "Moving" : "Uploading";
+    toast.info(
+      `${verb} ${plural(started, "item")}`,
+      plan.direction === "download" ? `to ${plan.dir}` : `to ${s3Uri(plan.bucket, plan.prefix)}${plan.stayOnShare ? ". The files stay on the network location." : ""}`,
+    );
   }
   if (move) {
     move.starting = false;
@@ -498,8 +508,10 @@ function maybeFinish(move: PendingMove) {
       });
     }
   } else {
-    // Exactly the local files whose upload completed (a folder's own files one by one, never the folder).
-    const paths = done.map((d) => d.source);
+    // Exactly the local files whose upload completed (a folder's own files one by one, never the
+    // folder). Never a file on a network location (no recycle bin; such a move never gets here).
+    const paths = done.map((d) => d.source).filter((p) => !isNetworkPath(p));
+    if (!paths.length) return;
     void trashLocalPaths(paths, `Moved ${plural(done.length, "file")} ${move.label}`).then(() => {
       if (partial) toast.info("Some items were not moved", partial.trim());
     });

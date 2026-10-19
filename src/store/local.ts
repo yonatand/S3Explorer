@@ -23,14 +23,56 @@ import { tooMany } from "./ops";
 const WINDOWS = api.clientOS === "windows";
 
 /**
- * Is `text` an absolute local path as typed (`C:\…`, `C:`, `/…` outside Windows, or a UNC / device
- * path, which the backend refuses with its own message)?
+ * Is `text` an absolute local path as typed (`C:\…`, `C:`, `/…` outside Windows, a UNC path
+ * `\\server\share\…` or `//server/share`, or a device path, which the backend refuses with its own
+ * message)?
  */
 export function looksLocal(text: string): boolean {
   if (/^[A-Za-z]:([\\/]|$)/.test(text)) return true;
   if (/^(\\\\|\/\/)/.test(text)) return true;
   return !WINDOWS && text.startsWith("/");
 }
+
+/**
+ * The share root of a UNC path exactly as typed (`\\server\share` or `//server/share`, either
+ * separator), or null when `path` is not a UNC path naming a server and a share. Device paths
+ * (`\\.\…`, `\\?\…`) are not UNC paths here.
+ */
+export function uncRoot(path: string): string | null {
+  const m = /^[\\/]{2}([^\\/]+)[\\/]([^\\/]+)/.exec(path);
+  if (!m || m[1] === "." || m[1] === "?") return null;
+  return m[0];
+}
+
+/** A UNC path that names a server and a share (`\\server\share[\…]`, `//server/share[/…]`). */
+export const isUncPath = (path: string) => uncRoot(path) !== null;
+
+/**
+ * Starts like a network or device path (`\\` or `//`) but is not one this app accepts: a device
+ * path, or a server without a share. The backend refuses it with its own message (shown inline).
+ */
+const refusedUnc = (path: string) => /^(\\\\|\/\/)/.test(path) && !isUncPath(path);
+
+/** The root of a mapped network drive: a drive whose label shows the UNC it maps to (`Z: (\\nas\data)`). */
+function mappedDriveRoot(path: string): string | null {
+  const m = /^([A-Za-z]:)/.exec(path);
+  if (!m) return null;
+  const drive = m[1].toLowerCase();
+  const r = useLocalRoots.getState().roots.find((x) => x.kind === "drive" && x.path.slice(0, 2).toLowerCase() === drive);
+  return r && /\([\\/]{2}[^)]+\)\s*$/.test(r.label) ? r.path : null;
+}
+
+/** A root that is a network location: a saved Network Location, or a mapped network drive. */
+export const isNetworkRoot = (r: LocalRoot) => r.kind === "network" || (r.kind === "drive" && /\([\\/]{2}[^)]+\)\s*$/.test(r.label));
+
+/**
+ * Is `path` on a network location (a UNC path, or a mapped network drive)? Those have no recycle
+ * bin, so this app never deletes there (see "Network locations in a local pane" in docs/CONTRACT.md).
+ */
+export const isNetworkPath = (path: string) => isUncPath(path) || mappedDriveRoot(path) !== null;
+
+/** Why a delete on a network location isn't done here. */
+export const NO_RECYCLE_BIN = "No recycle bin on a network location; delete it in the file manager";
 
 /** "C:" means the drive root. */
 const asTypedDir = (text: string) => (/^[A-Za-z]:$/.test(text) ? `${text}\\` : text);
@@ -46,7 +88,10 @@ export function typedParent(path: string): string | null {
   const sep = sepOf(path);
   const trimmed = path.length > 1 ? path.replace(/[\\/]+$/, "") : path;
   if (/^[A-Za-z]:$/.test(trimmed) || trimmed === "" || trimmed === "/") return null;
-  const i = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  // A share root (`\\server\share`) has no parent: `\\server` alone is not a location.
+  const unc = uncRoot(trimmed);
+  if (unc !== null && unc.length >= trimmed.length) return null;
+  const i =Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
   if (i < 0) return null;
   const parent = trimmed.slice(0, i);
   if (/^[A-Za-z]:$/.test(parent)) return parent + "\\";
@@ -55,15 +100,20 @@ export function typedParent(path: string): string | null {
 
 /**
  * The path bar's segments of a directory: each one a prefix of the path string exactly as given
- * (`C:\Users\demo` → `C:\`, `C:\Users`, `C:\Users\demo`), so a click sends back a real path.
+ * (`C:\Users\demo` → `C:\`, `C:\Users`, `C:\Users\demo`; `\\nas\data\sub` → `\\nas\data`,
+ * `\\nas\data\sub`), so a click sends back a real path.
  */
 export function localSegments(dir: string): { name: string; path: string }[] {
   const out: { name: string; path: string }[] = [];
   const m = /^([A-Za-z]:)[\\/]?/.exec(dir);
+  const unc = uncRoot(dir);
   let i = 0;
   if (m) {
     out.push({ name: m[1], path: m[1] + "\\" });
     i = m[0].length;
+  } else if (unc !== null) {
+    out.push({ name: unc, path: unc });
+    i = unc.length + 1;
   } else if (dir.startsWith("/")) {
     out.push({ name: "/", path: "/" });
     i = 1;
@@ -79,9 +129,15 @@ export function localSegments(dir: string): { name: string; path: string }[] {
   return out;
 }
 
-/** Same local path (case-insensitive on Windows and macOS), ignoring a trailing separator. */
+/**
+ * Same local path (case-insensitive on Windows and macOS), ignoring a trailing separator; on Windows
+ * `/` and `\` are the same separator (`//nas/data` is `\\nas\data`).
+ */
 export function sameLocalPath(a: string, b: string): boolean {
-  const n = (p: string) => (p.length > 1 ? p.replace(/[\\/]+$/, "") : p);
+  const n = (p: string) => {
+    const q = api.clientOS === "windows" ? p.replace(/\//g, "\\") : p;
+    return q.length > 1 ? q.replace(/[\\/]+$/, "") : q;
+  };
   return api.clientOS === "other" ? n(a) === n(b) : n(a).toLowerCase() === n(b).toLowerCase();
 }
 
@@ -218,10 +274,24 @@ export async function renameLocalEntry(path: string, newName: string): Promise<b
   }
 }
 
+/** Why the selection of a local pane can't go to the recycle bin (a network location), or null. */
+export function localTrashRefusal(pane: PaneId = activePane()): string | null {
+  const s = getPane(pane);
+  if (!isLocalPane(s)) return null;
+  if (isNetworkPath(s.local.dir) || selectedLocal(pane).some((e) => isNetworkPath(e.path))) return NO_RECYCLE_BIN;
+  return null;
+}
+
 /** Ask to move the selection of a local pane to the recycle bin (exact paths, captured now). */
 export function requestLocalTrash(pane: PaneId = activePane()) {
   const sel = selectedLocal(pane);
   if (!sel.length) return;
+  // A network location has no recycle bin: nothing there is ever deleted by this app.
+  const why = localTrashRefusal(pane);
+  if (why) {
+    toast.info("Nothing was deleted", why);
+    return;
+  }
   // The same limit as a delete job: at most 10,000 paths in one go.
   if (tooMany(sel.length, "move to the recycle bin")) return;
   openModal({ kind: "localTrash", paths: sel.map((e) => e.path), dirs: sel.filter((e) => e.isDir && !e.isSymlink).length });
@@ -448,9 +518,10 @@ async function goToLocal(pane: PaneId, path: string): Promise<string | null> {
     return null;
   } catch (e) {
     const err = e as AppError;
-    // A UNC or device path, or one with "..": the backend's own words. Any other InvalidInput (a
-    // file is "not a directory" there, or a link) still tries the parent with the file selected.
-    if (err.code === "InvalidInput" && (/^(\\\\|\/\/)/.test(path) || path.split(/[\\/]/).includes(".."))) return err.message;
+    // A device path, a server without a share, or a path with "..": the backend's own words. Any
+    // other InvalidInput (a file is "not a directory" there, or a link) still tries the parent with
+    // the file selected, on a share too.
+    if (err.code === "InvalidInput" && (refusedUnc(path) || path.split(/[\\/]/).includes(".."))) return err.message;
     // A file: open its folder with the file selected.
     const parent = typedParent(path);
     if (!parent) return err.message;

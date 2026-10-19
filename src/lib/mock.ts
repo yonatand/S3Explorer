@@ -2501,6 +2501,8 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
 // entries (dotfiles and the hidden attribute), symlinks (listed, never followed), an unreadable
 // folder, and D:\many with 60,000 files (past the 50,000 cap). Completed downloads add files here;
 // trash_local removes entries. Upload batches walk a folder that exists here.
+// v0.9.1: a network share \\nas\data (also a saved Network Location "NAS data") and a mapped network
+// drive Z: (its own small tree here). Neither has a recycle bin: trash_local refuses both.
 
 interface FsNode {
   path: string;
@@ -2511,6 +2513,12 @@ interface FsNode {
   isSymlink: boolean;
   hidden: boolean;
   unreadable?: boolean;
+}
+
+/** The share root of a UNC path (`\\server\share`, either separator), or null. Not a device path. */
+function uncShareRoot(path: string): string | null {
+  const m = /^[\\/]{2}([^\\/]+)[\\/]([^\\/]+)/.exec(path);
+  return m && m[1] !== "." && m[1] !== "?" ? m[0] : null;
 }
 
 /** Lower-cased, `\` separators, no trailing separator except on a drive root ("c:\"). */
@@ -2525,6 +2533,9 @@ function fsKey(path: string): string {
 function fsParent(path: string): string | null {
   const p = path.replace(/\//g, "\\").replace(/\\+$/, "");
   if (/^[A-Za-z]:$/.test(p)) return null;
+  // A share root (\\server\share) has no parent.
+  const unc = uncShareRoot(p);
+  if (unc !== null && unc.length >= p.length) return null;
   const i = p.lastIndexOf("\\");
   if (i < 0) return null;
   const parent = p.slice(0, i);
@@ -2538,7 +2549,8 @@ const fsChildren = new Map<string, Set<string>>();
 
 function fsAdd(path: string, opts: { isDir?: boolean; size?: number; ageDays?: number; isSymlink?: boolean; hidden?: boolean; unreadable?: boolean } = {}) {
   const key = fsKey(path);
-  const name = /^[A-Za-z]:\\?$/.test(path) ? path.slice(0, 2) + "\\" : lastSegment(path);
+  const unc = uncShareRoot(path);
+  const name = /^[A-Za-z]:\\?$/.test(path) ? path.slice(0, 2) + "\\" : unc !== null && unc.length >= path.replace(/[\\/]+$/, "").length ? unc : lastSegment(path);
   const node: FsNode = {
     path,
     name,
@@ -2641,6 +2653,20 @@ function seedLocalFs() {
   fsDir("D:\\Media", { ageDays: 400 });
   fsDir("D:\\many", { ageDays: 30 });
   fsFile("D:\\Media\\soundtrack.flac", 41 * MB, { ageDays: 380 });
+  // v0.9.1: the network share \\nas\data (a saved Network Location "NAS data") and the mapped drive Z:.
+  const N = "\\\\nas\\data";
+  fsDir(N, { ageDays: 600 });
+  fsDir(`${N}\\sub`, { ageDays: 90 });
+  fsFile(`${N}\\sub\\inventory.csv`, 52_000, { ageDays: 10 });
+  fsFile(`${N}\\sub\\notes from nas.txt`, 2_300, { ageDays: 4 });
+  fsDir(`${N}\\shared photos`, { ageDays: 200 });
+  for (let i = 1; i <= 3; i++) fsFile(`${N}\\shared photos\\team-${i}.jpg`, 2_100_000 + i * 51_000, { ageDays: 200 });
+  fsFile(`${N}\\handbook.pdf`, 1_250_000, { ageDays: 30 });
+  fsFile(`${N}\\q3 figures.xlsx`, 188_000, { ageDays: 7 });
+  fsDir("Z:\\", { ageDays: 600 });
+  fsDir("Z:\\sub", { ageDays: 90 });
+  fsFile("Z:\\handbook.pdf", 1_250_000, { ageDays: 30 });
+  fsFile("Z:\\sub\\inventory.csv", 52_000, { ageDays: 10 });
 }
 seedLocalFs();
 
@@ -2656,12 +2682,33 @@ const localSizeGen = new Map<string, number>();
 let localSizeSeq = 0;
 let localSizeLimit: number = LOCAL_LIMITS.dirSizeMaxEntries;
 
-/** Paths the backend refuses: relative, UNC, device, "..". Throws `InvalidInput`. */
+/**
+ * Paths the backend refuses: relative, device paths (\\.\, \\?\), a server without a share, "..".
+ * Throws `InvalidInput`. UNC paths `\\server\share[\…]` and `//server/share` are accepted (v0.9.1).
+ */
 function checkLocalPath(path: unknown, what = "The path") {
   if (typeof path !== "string" || !path) throw invalid(`${what} must not be empty.`);
-  if (/^(\\\\|\/\/)/.test(path)) throw invalid(`${what} must be on a drive of this computer: network and device paths are not supported.`);
-  if (!/^[A-Za-z]:[\\/]/.test(path)) throw invalid(`${what} must be absolute.`);
+  if (/^(\\\\|\/\/)/.test(path)) {
+    if (/^[\\/]{2}[.?]([\\/]|$)/.test(path)) throw invalid(`${what} is a device path; those are not supported.`);
+    if (uncShareRoot(path) === null) throw invalid(`${what} names a network server without a share; type \\\\server\\share.`);
+  } else if (!/^[A-Za-z]:[\\/]/.test(path)) throw invalid(`${what} must be absolute.`);
   if (path.split(/[\\/]/).includes("..")) throw invalid(`${what} must not contain “..”.`);
+}
+
+/** A share this fake network knows (\\nas\data); any other one is "not found" (os error 53). */
+function checkKnownShare(path: string) {
+  const unc = uncShareRoot(path);
+  if (unc !== null && !fsNodes.has(fsKey(unc))) throw fail("Io", `${path}: The network path was not found. (os error 53)`);
+}
+
+/** trash_local's per-path failure for a UNC path (see "Network locations" in docs/CONTRACT.md). */
+const NO_RECYCLE_BIN_MESSAGE = "No recycle bin on a network location; delete it in the file manager";
+
+/** Why a path can't go to the recycle bin because it is on a network location, or null. */
+function networkTrashRefusal(path: string): string | null {
+  if (uncShareRoot(path) !== null) return NO_RECYCLE_BIN_MESSAGE;
+  if (/^z:/i.test(path)) return "Drive Z: has no recycle bin (removable, network or optical drive); nothing was deleted. Delete it in your file manager.";
+  return null;
 }
 
 /** The path or one of its ancestors is a link (the backend refuses to go through one: InvalidInput). */
@@ -2678,6 +2725,7 @@ const byName = (a: { name: string }, b: { name: string }) => (a.name.toLowerCase
 
 function mockListLocalDir(path: string, showHidden: boolean): LocalListing {
   checkLocalPath(path);
+  checkKnownShare(path);
   const key = fsKey(path);
   const node = fsNodes.get(key);
   if (!node) throw fail("Io", `${path}: The system cannot find the path specified. (os error 3)`);
@@ -2764,6 +2812,12 @@ function mockTrashLocal(paths: string[]): TrashResult {
       checkLocalPath(path);
     } catch (e) {
       failed.push({ path, message: (e as AppError).message });
+      continue;
+    }
+    // A network location has no recycle bin: never deleted, whatever is there.
+    const net = networkTrashRefusal(path);
+    if (net) {
+      failed.push({ path, message: net });
       continue;
     }
     const key = fsKey(path);
@@ -3932,6 +3986,10 @@ export const mockBackend: Backend = {
     return [
       { path: "C:\\", label: "Local Disk (C:)", kind: "drive" },
       { path: "D:\\", label: "Data (D:)", kind: "drive" },
+      // v0.9.1: a mapped network drive stays a drive, labelled with the UNC it maps to; then the
+      // saved Network Locations (kind "network"), after the drives.
+      { path: "Z:\\", label: "Z: (\\\\nas\\data)", kind: "drive" },
+      { path: "\\\\nas\\data", label: "NAS data", kind: "network" },
       { path: "C:\\Users\\demo", label: "Home", kind: "home" },
     ];
   },
