@@ -29,6 +29,30 @@ pub fn decode(png: &'static [u8]) -> AppResult<tauri::image::Image<'static>> {
     tauri::image::Image::from_bytes(png).map_err(|e| AppError::new(crate::error::ErrorCode::Unknown, format!("Bundled icon is unreadable: {e}")))
 }
 
+/// Gives `window` the icons of `accent`. On Windows this must run on the main (window) thread:
+/// the title-bar, taskbar and window-class icons are set there in one go (see
+/// `windows_shell::set_window_icons_rgba`). Elsewhere the 256 px icon goes through Tauri.
+pub fn apply<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>, accent: AccentColor) -> AppResult<()> {
+    let (small, big) = icon_png(accent);
+    let failed = |e: tauri::Error| AppError::new(crate::error::ErrorCode::Unknown, format!("Could not set the window icon: {e}"));
+    #[cfg(windows)]
+    {
+        let (small, big) = (decode(small)?, decode(big)?);
+        let hwnd = window.hwnd().map_err(failed)?.0 as isize;
+        crate::windows_shell::set_window_icons_rgba(
+            hwnd,
+            (small.rgba(), small.width(), small.height()),
+            (big.rgba(), big.width(), big.height()),
+        )
+        .map_err(|m| AppError::new(crate::error::ErrorCode::Unknown, format!("Could not set the window icon: {m}")))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = small;
+        window.set_icon(decode(big)?).map_err(failed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

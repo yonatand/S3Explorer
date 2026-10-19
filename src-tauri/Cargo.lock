@@ -4446,6 +4446,7 @@ dependencies = [
  "trash",
  "unicode-normalization",
  "uuid",
+ "windows",
 ]
 
 [[package]]

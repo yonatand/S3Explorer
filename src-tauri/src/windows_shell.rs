@@ -80,15 +80,13 @@ fn set_big_icon(hwnd: isize) {
     }
 }
 
-/// v0.9.0: makes the window's large (taskbar / Alt+Tab) icon an icon built from `rgba` (straight
-/// alpha, `width` x `height`), destroying the one this function set before. Tauri's `set_icon`
-/// only replaces the small (title bar) icon on Windows.
+/// The icons [`set_window_icons_rgba`] created last (0 = none), released when replaced.
 #[cfg(windows)]
-pub fn set_big_icon_rgba(hwnd: isize, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
-    use std::sync::atomic::{AtomicIsize, Ordering};
-    /// The large icon this function created last (0 = none): released when replaced.
-    static CREATED: AtomicIsize = AtomicIsize::new(0);
+static CREATED: std::sync::Mutex<(isize, isize)> = std::sync::Mutex::new((0, 0));
 
+/// An `HICON` from `rgba` (straight alpha, `width` x `height`), owned by the caller.
+#[cfg(windows)]
+fn icon_from_rgba(rgba: &[u8], width: u32, height: u32) -> Result<isize, String> {
     if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
         return Err("The icon image has the wrong size".into());
     }
@@ -97,23 +95,87 @@ pub fn set_big_icon_rgba(hwnd: isize, rgba: &[u8], width: u32, height: u32) -> R
     for px in bgra.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
-    // Mask rows are padded to 16 bits.
-    let mask_row = (width as usize).div_ceil(16) * 2;
-    let mask = vec![0u8; mask_row * height as usize];
-    // SAFETY: both buffers are as large as the sizes passed say; the icon is owned by us and
-    // destroyed only after the window no longer uses it.
-    unsafe {
-        let icon = ffi::CreateIcon(0, width as i32, height as i32, 1, 32, mask.as_ptr(), bgra.as_ptr());
-        if icon == 0 {
-            return Err("CreateIcon failed".into());
+    let mask = vec![0u8; mask_len(width, height)];
+    // SAFETY: both buffers are as large as the sizes passed say.
+    let icon = unsafe { ffi::CreateIcon(0, width as i32, height as i32, 1, 32, mask.as_ptr(), bgra.as_ptr()) };
+    if icon == 0 {
+        return Err("CreateIcon failed".into());
+    }
+    Ok(icon)
+}
+
+/// Bytes of a 1-bit AND mask: rows padded to 16 bits.
+#[cfg(windows)]
+fn mask_len(width: u32, height: u32) -> usize {
+    (width as usize).div_ceil(16) * 2 * height as usize
+}
+
+/// v0.9.1 "Taskbar icon follows the accent": gives the window `small` (title bar, 32 px) and `big`
+/// (taskbar / Alt+Tab, 256 px) icons, each `(rgba, width, height)`. Call on the window's thread.
+///
+/// The sequence, and why each step is there:
+/// 1. Both icons are created first; nothing changes if either fails.
+/// 2. The window class icons (`GCLP_HICON`, `GCLP_HICONSM`) are replaced: the shell falls back to
+///    them whenever the window answers `WM_GETICON` with nothing, and tao registers its class
+///    without any.
+/// 3. `WM_SETICON` `ICON_SMALL` and `ICON_BIG` (after the class change, so the per-window icons
+///    are the last thing set): `DefWindowProc` stores them and repaints the caption; the taskbar
+///    asks the window for `ICON_BIG` / `ICON_SMALL2` when it redraws the button.
+/// 4. The window text is set again to itself: `WM_SETTEXT` makes the system send the shell's
+///    `HSHELL_REDRAW` for the window, which is what makes the taskbar re-read the button's title
+///    and icon right away.
+/// 5. The icons created by the previous call are destroyed (never the executable's shared icon,
+///    which this function never created).
+#[cfg(windows)]
+pub fn set_window_icons_rgba(hwnd: isize, small: (&[u8], u32, u32), big: (&[u8], u32, u32)) -> Result<(), String> {
+    let small_icon = icon_from_rgba(small.0, small.1, small.2)?;
+    let big_icon = match icon_from_rgba(big.0, big.1, big.2) {
+        Ok(i) => i,
+        Err(e) => {
+            // SAFETY: created just above and never handed to a window.
+            unsafe { ffi::DestroyIcon(small_icon) };
+            return Err(e);
         }
-        ffi::SendMessageW(hwnd, ffi::WM_SETICON, ffi::ICON_BIG, icon);
-        let previous = CREATED.swap(icon, Ordering::SeqCst);
-        if previous != 0 {
-            ffi::DestroyIcon(previous);
+    };
+    // SAFETY: plain Win32 calls on a window handle; the icons stay alive until a later call has
+    // replaced them on both the window and its class.
+    unsafe {
+        ffi::SetClassLongPtrW(hwnd, ffi::GCLP_HICON, big_icon);
+        ffi::SetClassLongPtrW(hwnd, ffi::GCLP_HICONSM, small_icon);
+        ffi::SendMessageW(hwnd, ffi::WM_SETICON, ffi::ICON_SMALL, small_icon);
+        ffi::SendMessageW(hwnd, ffi::WM_SETICON, ffi::ICON_BIG, big_icon);
+        refresh_taskbar_button(hwnd);
+    }
+    let previous = {
+        let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *created, (small_icon, big_icon))
+    };
+    for icon in [previous.0, previous.1] {
+        if icon != 0 {
+            // SAFETY: created by an earlier call and no longer set on the window or its class.
+            unsafe { ffi::DestroyIcon(icon) };
         }
     }
     Ok(())
+}
+
+/// Sets the window's text to itself so the shell gets `HSHELL_REDRAW` and repaints the taskbar
+/// button (icon included).
+///
+/// # Safety
+/// `hwnd` is a window of this thread (or 0, which makes the calls fail harmlessly).
+#[cfg(windows)]
+unsafe fn refresh_taskbar_button(hwnd: isize) {
+    let mut buf = vec![0u16; 512];
+    // SAFETY: `buf` is writable for the length passed; the result is NUL-terminated.
+    let n = unsafe { ffi::GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 0 {
+        return;
+    }
+    buf.truncate(n as usize);
+    buf.push(0);
+    // SAFETY: NUL-terminated text that outlives the call.
+    unsafe { ffi::SetWindowTextW(hwnd, buf.as_ptr()) };
 }
 
 #[cfg(windows)]
@@ -141,7 +203,10 @@ mod ffi {
     pub const IMAGE_ICON: u32 = 1;
     pub const LR_SHARED: u32 = 0x8000;
     pub const WM_SETICON: u32 = 0x0080;
+    pub const ICON_SMALL: usize = 0;
     pub const ICON_BIG: usize = 1;
+    pub const GCLP_HICON: i32 = -14;
+    pub const GCLP_HICONSM: i32 = -34;
 
     #[link(name = "user32")]
     extern "system" {
@@ -165,6 +230,9 @@ mod ffi {
             xor_bits: *const u8,
         ) -> isize;
         pub fn DestroyIcon(icon: isize) -> i32;
+        pub fn SetClassLongPtrW(hwnd: isize, index: i32, value: isize) -> usize;
+        pub fn GetWindowTextW(hwnd: isize, text: *mut u16, max: i32) -> i32;
+        pub fn SetWindowTextW(hwnd: isize, text: *const u16) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -205,9 +273,34 @@ mod tests {
     }
 
     #[test]
-    fn a_big_icon_needs_a_matching_buffer() {
-        assert!(set_big_icon_rgba(0, &[0; 15], 2, 2).is_err());
-        assert!(set_big_icon_rgba(0, &[], 0, 0).is_err());
+    fn icons_need_a_matching_buffer() {
+        let ok = [0u8; 16];
+        assert!(set_window_icons_rgba(0, (&[0; 15], 2, 2), (&ok, 2, 2)).is_err());
+        assert!(set_window_icons_rgba(0, (&ok, 2, 2), (&[], 0, 0)).is_err());
+        assert!(set_window_icons_rgba(0, (&ok, 2, 2), (&ok, 2, 3)).is_err());
+        assert!(icon_from_rgba(&[0; 4 * 32 * 32 - 1], 32, 32).is_err());
+    }
+
+    #[test]
+    fn mask_rows_are_padded_to_sixteen_bits() {
+        assert_eq!(mask_len(32, 32), 4 * 32);
+        assert_eq!(mask_len(256, 256), 32 * 256);
+        assert_eq!(mask_len(1, 1), 2);
+        assert_eq!(mask_len(17, 2), 8);
+    }
+
+    /// With no window (handle 0) the calls fail harmlessly; the icons are still created, kept and
+    /// replaced (the previous pair destroyed) on each call.
+    #[test]
+    fn a_second_call_replaces_the_icons_it_created() {
+        let small = vec![255u8; 32 * 32 * 4];
+        let big = vec![128u8; 256 * 256 * 4];
+        set_window_icons_rgba(0, (&small, 32, 32), (&big, 256, 256)).expect("first");
+        let first = *CREATED.lock().expect("lock");
+        assert!(first.0 != 0 && first.1 != 0);
+        set_window_icons_rgba(0, (&small, 32, 32), (&big, 256, 256)).expect("second");
+        let second = *CREATED.lock().expect("lock");
+        assert!(second.0 != 0 && second.1 != 0 && second != first);
     }
 
     /// The test binary lives in `target\debug\deps`, not `target\debug`, so it counts as an

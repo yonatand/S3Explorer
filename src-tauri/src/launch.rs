@@ -125,17 +125,42 @@ fn parse_s3(loc: &str) -> Result<Option<S3Location>, String> {
 }
 
 /// A local location made absolute against `cwd`, `.` and `..` resolved lexically, then held to the
-/// local pane's path rules (no UNC or device path).
+/// local pane's path rules (no device path; v0.9.1: a UNC share `\\server\share[\...]` or
+/// `//server/share` is accepted and written with backslashes, `\\server` alone is refused).
 fn resolve_local(loc: &str, cwd: &Path) -> Result<String, String> {
     // Windows: `"C:\My Folder\"` arrives as `C:\My Folder"` (the backslash escapes the quote).
     let loc = if cfg!(windows) { loc.strip_suffix('"').unwrap_or(loc) } else { loc };
     if loc.trim().is_empty() {
         return Err("The location is empty".into());
     }
+    // Starts like a UNC or device path: its `\\server\share` part is held to the rules as typed, so
+    // `\\server` without a share is refused rather than read as the folder `\server` of the current
+    // drive (`..` after the share is resolved below like anywhere else).
+    if cfg!(windows) && loc.len() >= 2 && loc.chars().take(2).all(|c| c == '\\' || c == '/') {
+        match Path::new(loc).components().next() {
+            Some(Component::Prefix(p)) => {
+                let mut share = p.as_os_str().to_os_string();
+                share.push(r"\");
+                crate::local_fs::check_path(&share.to_string_lossy()).map_err(|e| format!("{loc}: {}", e.message))?;
+            }
+            _ => return Err(format!(r"{loc}: not a valid network path (\\server\share)")),
+        }
+    }
     let joined = cwd.join(loc);
     let mut out = PathBuf::new();
     for c in joined.components() {
         match c {
+            #[cfg(windows)]
+            Component::Prefix(p) => match p.kind() {
+                std::path::Prefix::UNC(server, share) => {
+                    let mut unc = std::ffi::OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    out.push(unc);
+                }
+                _ => out.push(c.as_os_str()),
+            },
             Component::CurDir => {}
             Component::ParentDir => {
                 // Never above the root.
@@ -279,7 +304,22 @@ mod tests {
             assert_eq!(req(&[r"C:\..\..\x"]).local.as_deref(), Some(r"C:\x"));
             // Root-relative: the current folder's drive.
             assert_eq!(req(&[r"\Temp"]).local.as_deref(), Some(r"C:\Temp"));
-            for bad in [r"\\server\share\x", r"\\?\C:\x", r"\\.\PhysicalDrive0", "//server/share", "D:relative"] {
+            // v0.9.1: network shares, written with backslashes; `..` never climbs above the share.
+            assert_eq!(req(&[r"\\server\share\x y"]).local.as_deref(), Some(r"\\server\share\x y"));
+            assert_eq!(req(&["//server/share/a/b"]).local.as_deref(), Some(r"\\server\share\a\b"));
+            assert_eq!(req(&["//server/share"]).local.as_deref(), Some(r"\\server\share\"));
+            assert_eq!(req(&[r"\\server\share\a\..\..\..\b"]).local.as_deref(), Some(r"\\server\share\b"));
+            for bad in [
+                r"\\?\C:\x",
+                r"\\?\UNC\server\share",
+                r"\\.\PhysicalDrive0",
+                "//./C:/x",
+                r"\\server",
+                r"\\server\",
+                "//server",
+                r"\\server\..\x",
+                "D:relative",
+            ] {
                 assert!(parse(&args(&[bad]), &c).is_err(), "{bad}");
             }
         } else {

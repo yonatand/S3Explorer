@@ -7,19 +7,24 @@ use crate::error::{AppError, AppResult, ErrorCode};
 use crate::local_fs::{self, LocalDirSize, LocalListing, LocalRoot, TrashResult};
 use crate::state::AppState;
 
+/// Drives, then (v0.9.1, Windows) the saved Network Locations resolved within 15 s, then home.
 #[tauri::command]
 pub async fn list_local_roots() -> AppResult<Vec<LocalRoot>> {
-    Ok(tokio::task::spawn_blocking(local_fs::roots).await?)
+    local_fs::roots_with_network().await
 }
 
-/// Lists `path` and remembers it (canonical) so `open_local` may open the files shown.
+/// Lists `path` and remembers it (canonical) so `open_local` may open the files shown. On a
+/// network location (v0.9.1) the listing fails `Io` after 15 s without reading an entry.
 #[tauri::command]
 pub async fn list_local_dir(state: State<'_, AppState>, path: String, show_hidden: bool) -> AppResult<LocalListing> {
-    let (listing, canonical) = tokio::task::spawn_blocking(move || {
-        let listing = local_fs::list_dir(&path, show_hidden)?;
+    let stall = local_fs::stall_bound(&path);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (listing, canonical) = local_fs::watched(stall, stop, move |hb, stop| {
+        let listing = local_fs::list_dir_watched(&path, show_hidden, local_fs::LOCAL_MAX_ENTRIES, hb, stop)?;
+        hb.beat();
         AppResult::Ok((listing, local_fs::canonical_dir(&path)))
     })
-    .await??;
+    .await?;
     if let Some(dir) = canonical {
         state.listed_dirs.record(dir);
     }

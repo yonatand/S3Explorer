@@ -25,6 +25,8 @@ pub mod profiles;
 pub mod saved;
 pub mod search;
 pub mod settings;
+#[cfg(windows)]
+pub mod shell_link;
 pub mod state;
 pub mod tags;
 #[cfg(test)]
@@ -121,8 +123,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
-            // The config windows exist by now; give them the taskbar icon of this executable.
-            windows_shell::set_taskbar_icons(app);
             let sink: Arc<dyn ProgressSink> = Arc::new(TauriSink(app.handle().clone()));
             let job_sink: Arc<dyn JobSink> = Arc::new(TauriJobSink(app.handle().clone()));
             let batch_sink: Arc<dyn BatchSink> = Arc::new(TauriBatchSink(app.handle().clone()));
@@ -132,6 +132,19 @@ pub fn run() {
                 Some(dir) => SettingsStore::load(dir.join(settings::SETTINGS_FILE)),
                 None => SettingsStore::in_memory(Default::default()),
             };
+            // v0.9.1: the main window is created hidden (`visible: false` in tauri.conf.json) so
+            // its first icon is already the saved accent's: the taskbar never shows another one
+            // first. Shown whatever happens with the icon.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(e) = window_icon::apply(&window, store.get().accent) {
+                    eprintln!("{}", e.message);
+                    // At least the large icon of this executable, as before v0.9.1.
+                    windows_shell::set_taskbar_icons(app);
+                }
+                if let Err(e) = window.show() {
+                    eprintln!("Could not show the main window: {e}");
+                }
+            }
             let keychain = Arc::new(OsKeychain::new());
             let connections = match &config_dir {
                 Some(dir) => ConnectionStore::load(dir.join(saved::CONNECTIONS_FILE), keychain),

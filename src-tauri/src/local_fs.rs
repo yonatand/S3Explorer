@@ -5,18 +5,22 @@
 //! here on a blocking thread.
 //!
 //! Rules (data safety):
-//! - Only absolute paths with a drive letter (Windows) or a leading `/`; no `..` component. UNC
-//!   (`\\server\share`) and device paths (`\\.\`, `\\?\`) are `InvalidInput`.
+//! - Only absolute paths with a drive letter or a UNC share (Windows, v0.9.1: `\\server\share[\…]`
+//!   or `//server/share`) or a leading `/`; no `..` component. Device paths (`\\.\`, `\\?\`) and
+//!   `\\server` without a share are `InvalidInput`.
+//! - A listing or size scan on a UNC path that reads no entry for [`NETWORK_STALL`] fails `Io`
+//!   ("network location did not respond") instead of hanging.
 //! - Links (symbolic links, junctions) are never followed: listed as links, never listed into,
 //!   never counted into, renamed and trashed as the link itself.
 //! - Nothing here deletes permanently: `trash_paths` only moves to the recycle bin / trash, and on
-//!   Windows refuses drives that have no recycle bin (anything but a fixed disk).
+//!   Windows refuses drives that have no recycle bin (anything but a fixed disk) and every UNC path.
 //! - Nothing here replaces an existing file or folder.
 
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -37,6 +41,13 @@ pub const TRASH_MAX_PATHS: usize = crate::models::JOB_MAX_ITEMS;
 pub const LOCAL_DIR_SIZE_PARALLEL: usize = 4;
 /// Most roots `list_local_roots` returns.
 const ROOTS_MAX: usize = 64;
+/// v0.9.1: a listing or size scan of a network location, or resolving the saved Network Locations,
+/// fails after this long without progress.
+pub const NETWORK_STALL: Duration = Duration::from_secs(15);
+/// The message of that failure (`Io`).
+pub const NETWORK_STALL_MESSAGE: &str = "network location did not respond";
+/// The per-path failure of `trash_local` for a UNC path.
+pub const NO_NETWORK_TRASH: &str = "no recycle bin on a network location; delete it in the file manager";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +55,8 @@ pub enum LocalRootKind {
     Drive,
     Home,
     Folder,
+    /// v0.9.1: a saved Network Location (Windows), resolved to its UNC target.
+    Network,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,7 +119,8 @@ fn io_error(what: &str, path: &str, e: &std::io::Error) -> AppError {
 }
 
 /// Checks a path sent by the frontend and returns it unchanged as a `PathBuf`: absolute, with a
-/// drive letter on Windows (no UNC or device path), no `..` component.
+/// drive letter or (v0.9.1) a UNC share on Windows (no device or verbatim path, no `\\server`
+/// without a share), no `..` component.
 pub fn check_path(path: &str) -> AppResult<PathBuf> {
     if path.trim().is_empty() {
         return Err(AppError::invalid("A local path is required"));
@@ -114,10 +128,21 @@ pub fn check_path(path: &str) -> AppResult<PathBuf> {
     let p = Path::new(path);
     #[cfg(windows)]
     if let Some(Component::Prefix(prefix)) = p.components().next() {
-        if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
-            return Err(AppError::invalid(format!(
-                "{path}: network (UNC) and device paths are not supported; use a path that starts with a drive letter"
-            )));
+        use std::path::Prefix;
+        match prefix.kind() {
+            Prefix::Disk(_) => {}
+            Prefix::UNC(server, share) => {
+                // `//?/` and `//./` are device paths to Windows even with forward slashes.
+                let bad = |c: &std::ffi::OsStr| c.is_empty() || c == "." || c == ".." || c == "?";
+                if bad(server) || bad(share) {
+                    return Err(AppError::invalid(format!(r"{path}: not a valid network path (\\server\share)")));
+                }
+            }
+            _ => {
+                return Err(AppError::invalid(format!(
+                    r"{path}: device paths are not supported; use a path that starts with a drive letter or \\server\share"
+                )))
+            }
         }
     }
     if !p.is_absolute() {
@@ -127,6 +152,83 @@ pub fn check_path(path: &str) -> AppResult<PathBuf> {
         return Err(AppError::invalid(format!("{path}: the path must not contain \"..\"")));
     }
     Ok(p.to_path_buf())
+}
+
+/// Whether `path` names a network location by UNC (`\\server\share`, `//server/share`, or the
+/// verbatim `\\?\UNC\…`). Always `false` outside Windows.
+pub fn is_unc(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        matches!(path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Progress of a blocking walk, read by [`watched`]: the time of the last entry read.
+pub struct Heartbeat {
+    start: Instant,
+    /// Milliseconds after `start`.
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self { start: Instant::now(), last: std::sync::atomic::AtomicU64::new(0) }
+    }
+}
+
+impl Heartbeat {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Progress was made now.
+    pub fn beat(&self) {
+        let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// How long since the last progress (or since the start).
+    pub fn idle(&self) -> Duration {
+        self.start.elapsed().saturating_sub(Duration::from_millis(self.last.load(Ordering::Relaxed)))
+    }
+}
+
+/// Runs `work` on a blocking thread. With `stall`, a watchdog fails the call `Io`
+/// ([`NETWORK_STALL_MESSAGE`]) once `work` has not beaten its [`Heartbeat`] for that long, and sets
+/// `stop` so the walk ends at its next entry (a thread stuck inside the OS is abandoned; its
+/// result is dropped). Without `stall` it simply waits for `work`.
+pub async fn watched<T, F>(stall: Option<Duration>, stop: Arc<AtomicBool>, work: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Heartbeat, &AtomicBool) -> AppResult<T> + Send + 'static,
+{
+    let hb = Arc::new(Heartbeat::new());
+    let (hb2, stop2) = (hb.clone(), stop.clone());
+    let mut task = tokio::task::spawn_blocking(move || work(&hb2, &stop2));
+    let Some(stall) = stall else { return task.await? };
+    let tick = (stall / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            r = &mut task => return r?,
+            _ = tokio::time::sleep(tick) => {
+                if hb.idle() >= stall {
+                    stop.store(true, Ordering::Relaxed);
+                    return Err(AppError::new(ErrorCode::Io, NETWORK_STALL_MESSAGE));
+                }
+            }
+        }
+    }
+}
+
+/// The stall bound for a path: [`NETWORK_STALL`] on a network location, none elsewhere.
+pub fn stall_bound(path: &str) -> Option<Duration> {
+    is_unc(Path::new(path)).then_some(NETWORK_STALL)
 }
 
 /// [`check_path`], then: exists (`Io` with the OS message otherwise), is a directory and is not
@@ -181,14 +283,26 @@ pub fn list_dir(path: &str, show_hidden: bool) -> AppResult<LocalListing> {
 /// (`truncated: true` when more exist). Hidden entries are skipped unless `show_hidden`, and do not
 /// count against the cap.
 pub fn list_dir_capped(path: &str, show_hidden: bool, cap: usize) -> AppResult<LocalListing> {
+    list_dir_watched(path, show_hidden, cap, &Heartbeat::new(), &AtomicBool::new(false))
+}
+
+/// [`list_dir_capped`] that beats `hb` for every entry read and ends `Cancelled` when `stop` is set
+/// (see [`watched`]).
+pub fn list_dir_watched(path: &str, show_hidden: bool, cap: usize, hb: &Heartbeat, stop: &AtomicBool) -> AppResult<LocalListing> {
     let dir = check_dir(path)?;
+    hb.beat();
     let read = std::fs::read_dir(&dir).map_err(|e| io_error("read", path, &e))?;
+    hb.beat();
     let mut out = LocalListing {
         parent: dir.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_string_lossy().into_owned()),
         ..LocalListing::default()
     };
     let mut shown = 0usize;
     for entry in read {
+        hb.beat();
+        if stop.load(Ordering::Relaxed) {
+            return Err(AppError::cancelled());
+        }
         // An entry that vanished or cannot be read mid-listing is left out.
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -361,6 +475,8 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
 #[cfg(windows)]
 mod ffi {
     pub const DRIVE_FIXED: u32 = 3;
+    pub const DRIVE_REMOTE: u32 = 4;
+    pub const NO_ERROR: u32 = 0;
 
     pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
     // Predefined keys are sign-extended 32-bit values (`(HKEY)(ULONG_PTR)(LONG)0x80000001`).
@@ -373,6 +489,11 @@ mod ffi {
         pub fn GetDriveTypeW(root: *const u16) -> u32;
         pub fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         pub fn GetVolumeNameForVolumeMountPointW(mount_point: *const u16, volume_name: *mut u16, len: u32) -> i32;
+    }
+
+    #[link(name = "mpr")]
+    extern "system" {
+        pub fn WNetGetConnectionW(local: *const u16, remote: *mut u16, len: *mut u32) -> u32;
     }
 
     #[link(name = "advapi32")]
@@ -552,6 +673,10 @@ fn trash_context() -> trash::TrashContext {
 /// Moves one path (as given; a link is moved as the link) to the recycle bin, and checks it is
 /// gone afterwards.
 fn trash_one(ctx: &trash::TrashContext, path: &str) -> Result<(), String> {
+    // v0.9.1: a share has no recycle bin; refused as typed, before anything is resolved.
+    if is_unc(Path::new(path)) {
+        return Err(NO_NETWORK_TRASH.into());
+    }
     let p = check_path(path).map_err(|e| e.message)?;
     if p.parent().is_none_or(|q| q.as_os_str().is_empty()) {
         return Err("A drive or root folder cannot be deleted".into());
@@ -600,31 +725,43 @@ pub fn trash_paths(paths: &[String]) -> AppResult<TrashResult> {
 /// Pending folders are kept as paths and opened one at a time, so at most one directory handle is
 /// open, however wide or deep the tree.
 pub fn dir_size(path: &str, limit: u64, stop: &AtomicBool) -> AppResult<LocalDirSize> {
-    dir_size_with(path, limit, stop, |p: &Path| std::fs::read_dir(p))
+    dir_size_with(path, limit, stop, &Heartbeat::new(), |p: &Path| std::fs::read_dir(p))
+}
+
+/// [`dir_size`] that beats `hb` for every folder opened and entry read (see [`watched`]).
+pub fn dir_size_watched(path: &str, limit: u64, hb: &Heartbeat, stop: &AtomicBool) -> AppResult<LocalDirSize> {
+    dir_size_with(path, limit, stop, hb, |p: &Path| std::fs::read_dir(p))
 }
 
 fn dir_size_with<I>(
     path: &str,
     limit: u64,
     stop: &AtomicBool,
+    hb: &Heartbeat,
     mut open: impl FnMut(&Path) -> std::io::Result<I>,
 ) -> AppResult<LocalDirSize>
 where
     I: Iterator<Item = std::io::Result<std::fs::DirEntry>>,
 {
     let root = check_dir(path)?;
+    hb.beat();
     let mut out = LocalDirSize::default();
     let mut seen: u64 = 0;
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut current = Some(open(&root).map_err(|e| io_error("read", path, &e))?);
     loop {
+        hb.beat();
         let Some(read) = current.take() else {
             let Some(next) = pending.pop() else { break };
+            if stop.load(Ordering::Relaxed) {
+                return Err(AppError::cancelled());
+            }
             // An unreadable subfolder is skipped.
             current = open(&next).ok();
             continue;
         };
         for entry in read {
+            hb.beat();
             if stop.load(Ordering::Relaxed) {
                 return Err(AppError::cancelled());
             }
@@ -688,7 +825,8 @@ impl LocalDirSizes {
             .run(id, async move {
                 let _guard = guard;
                 let _slot = self.slots.acquire().await.map_err(|_| AppError::cancelled())?;
-                tokio::task::spawn_blocking(move || dir_size(&path, limit, &stop)).await?
+                let stall = stall_bound(&path);
+                watched(stall, stop, move |hb, stop| dir_size_watched(&path, limit, hb, stop)).await
             })
             .await
     }
@@ -752,7 +890,8 @@ pub fn roots() -> Vec<LocalRoot> {
             let root = format!("{letter}:\\");
             // Ready: an empty card reader or optical drive fails here.
             if std::fs::metadata(&root).is_ok_and(|m| m.is_dir()) {
-                out.push(LocalRoot { path: root, label: format!("{letter}:"), kind: LocalRootKind::Drive });
+                let label = drive_label(letter, mapped_unc(letter).as_deref());
+                out.push(LocalRoot { path: root, label, kind: LocalRootKind::Drive });
             }
         }
     }
@@ -779,6 +918,125 @@ pub fn roots() -> Vec<LocalRoot> {
         out.push(LocalRoot { path: home.to_string_lossy().into_owned(), label: "Home".into(), kind: LocalRootKind::Home });
     }
     out
+}
+
+/// A drive's label: `Z:`, or for a mapped network drive the share it maps to, `Z: (\\nas\data)`.
+fn drive_label(letter: char, unc: Option<&str>) -> String {
+    match unc {
+        Some(u) if !u.is_empty() => format!("{letter}: ({u})"),
+        _ => format!("{letter}:"),
+    }
+}
+
+/// The UNC a mapped network drive letter stands for (`WNetGetConnectionW`), `None` for any other drive.
+#[cfg(windows)]
+fn mapped_unc(letter: char) -> Option<String> {
+    let root = wide(std::ffi::OsStr::new(&format!("{letter}:\\")));
+    // SAFETY: a NUL-terminated UTF-16 string that outlives the call.
+    if unsafe { ffi::GetDriveTypeW(root.as_ptr()) } != ffi::DRIVE_REMOTE {
+        return None;
+    }
+    let local = wide(std::ffi::OsStr::new(&format!("{letter}:")));
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `local` is NUL-terminated; `buf` is writable for `len` characters.
+    let status = unsafe { ffi::WNetGetConnectionW(local.as_ptr(), buf.as_mut_ptr(), &mut len) };
+    if status != ffi::NO_ERROR {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n])).filter(|u| !u.is_empty())
+}
+
+/// A saved Network Location as a root: its UNC target, labelled with the shortcut folder's name.
+/// `None` when the target is not an accepted UNC path (a web or FTP location, a local folder).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn network_root(name: &str, target: &str) -> Option<LocalRoot> {
+    let name = name.trim();
+    if name.is_empty() || !is_unc(Path::new(target)) || check_path(target).is_err() {
+        return None;
+    }
+    Some(LocalRoot { path: target.to_string(), label: name.to_string(), kind: LocalRootKind::Network })
+}
+
+/// `%APPDATA%\Microsoft\Windows\Network Shortcuts`, where Windows keeps the Network Locations.
+#[cfg(windows)]
+fn network_shortcuts_dir() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA").filter(|a| !a.is_empty()).map(PathBuf::from)?;
+    Some(appdata.join("Microsoft").join("Windows").join("Network Shortcuts"))
+}
+
+/// Each `<dir>\<name>\target.lnk` (sorted by name, links never entered) resolved through
+/// [`crate::shell_link`] and handed to `each` as soon as it is known; unresolvable or non-UNC
+/// targets are skipped. Initializes COM on the calling thread: call on a thread of its own.
+#[cfg(windows)]
+fn scan_network_shortcuts(dir: &Path, mut each: impl FnMut(LocalRoot) -> bool) {
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let mut folders: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect();
+    folders.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0)));
+    let _com = crate::shell_link::ComApartment::init();
+    for (name, folder) in folders {
+        let lnk = folder.join("target.lnk");
+        if !std::fs::symlink_metadata(&lnk).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let Ok(target) = crate::shell_link::target(&lnk) else { continue };
+        if let Some(root) = network_root(&name, &target) {
+            if !each(root) {
+                return;
+            }
+        }
+    }
+}
+
+/// The saved Network Locations found in `dir` within `bound` (on a thread of its own, COM
+/// initialized there); whatever resolved before the bound is kept, the rest is dropped.
+#[cfg(windows)]
+async fn network_roots_in(dir: PathBuf, bound: Duration) -> Vec<LocalRoot> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let spawned = std::thread::Builder::new()
+        .name("network-locations".into())
+        .spawn(move || scan_network_shortcuts(&dir, |root| tx.send(root).is_ok()));
+    if spawned.is_err() {
+        return Vec::new();
+    }
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut out = Vec::new();
+    while let Ok(Some(root)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        out.push(root);
+        if out.len() >= ROOTS_MAX {
+            break;
+        }
+    }
+    // Dropping `rx` ends the scan at its next shortcut.
+    out
+}
+
+/// `list_local_roots` (v0.9.1): [`roots`], with the saved Network Locations (Windows) after the
+/// drives, resolved within [`NETWORK_STALL`].
+pub async fn roots_with_network() -> AppResult<Vec<LocalRoot>> {
+    let mut out = tokio::task::spawn_blocking(roots).await?;
+    #[cfg(windows)]
+    if let Some(dir) = network_shortcuts_dir() {
+        let network = network_roots_in(dir, NETWORK_STALL).await;
+        out = merge_network(out, network);
+    }
+    Ok(out)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Inserts `network` after the drives (before the home folder), keeping at most [`ROOTS_MAX`]
+/// roots; the home folder is never the one dropped.
+fn merge_network(mut roots: Vec<LocalRoot>, network: Vec<LocalRoot>) -> Vec<LocalRoot> {
+    let home = roots.iter().position(|r| r.kind == LocalRootKind::Home).map(|i| roots.remove(i));
+    roots.extend(network);
+    roots.truncate(ROOTS_MAX - usize::from(home.is_some()));
+    roots.extend(home);
+    roots
 }
 
 /// Subfolders of `dir` that are not links, sorted.
@@ -815,14 +1073,22 @@ mod tests {
     }
 
     #[test]
-    fn relative_unc_and_device_paths_are_refused() {
+    fn relative_and_device_paths_are_refused() {
         let mut bad = vec!["", "  ", "relative", "sub/dir", "./x"];
         if cfg!(windows) {
             bad.extend([
-                r"\\server\share",
-                r"\\server\share\dir",
-                "//server/share/dir",
+                // v0.9.1: a server without a share, or `.`/`..` as either, is not a share.
+                r"\\server",
+                r"\\server\",
+                "//server",
+                r"\\server\..\x",
+                r"\\..\share\x",
+                r"\\server\.\x",
+                r"\\server\share\..\other",
+                "//server/share/../x",
                 r"\\.\C:\",
+                "//./C:/x",
+                "//?/C:/x",
                 r"\\.\PhysicalDrive0",
                 r"\\?\C:\Windows",
                 r"\\?\UNC\server\share",
@@ -842,6 +1108,249 @@ mod tests {
         }
         let ok = if cfg!(windows) { r"C:\Windows" } else { "/tmp" };
         assert_eq!(check_path(ok).expect("absolute"), PathBuf::from(ok));
+    }
+
+    /// v0.9.1: UNC shares are absolute paths, returned unchanged.
+    #[cfg(windows)]
+    #[test]
+    fn unc_shares_are_accepted() {
+        for ok in [r"\\server\share", r"\\server\share\", r"\\server\share\dir\f.txt", "//server/share", "//server/share/dir", r"\\nas.local\c$\x y"] {
+            assert_eq!(check_path(ok).unwrap_or_else(|e| panic!("{ok}: {}", e.message)), PathBuf::from(ok));
+            assert!(is_unc(Path::new(ok)), "{ok}");
+            assert_eq!(stall_bound(ok), Some(NETWORK_STALL), "{ok}");
+        }
+        assert!(is_unc(Path::new(r"\\?\UNC\server\share\x")));
+        for not in [r"C:\x", r"\\?\C:\x", r"\\.\C:\x", "relative", r"\\server"] {
+            assert!(!is_unc(Path::new(not)), "{not}");
+        }
+        assert_eq!(stall_bound(r"C:\x"), None);
+        // A share's root has no parent, like a drive root.
+        assert_eq!(Path::new(r"\\server\share\").parent(), None);
+    }
+
+    #[test]
+    fn heartbeat_measures_time_since_the_last_progress() {
+        let hb = Heartbeat::new();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(hb.idle() >= Duration::from_millis(30));
+        hb.beat();
+        assert!(hb.idle() < Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_fails_a_walk_that_stops_making_progress() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let e = watched(Some(Duration::from_millis(150)), stop.clone(), |hb, stop| {
+            hb.beat();
+            // Stuck (like a share that stopped answering), until told to stop.
+            let until = Instant::now() + Duration::from_secs(10);
+            while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            AppResult::Ok(())
+        })
+        .await
+        .expect_err("stalled");
+        assert_eq!((e.code, e.message.as_str()), (ErrorCode::Io, NETWORK_STALL_MESSAGE));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(stop.load(Ordering::Relaxed), "the walk is told to stop");
+        // Steady progress, slower in total than the bound: never fails.
+        let got = watched(Some(Duration::from_millis(150)), Arc::new(AtomicBool::new(false)), |hb, _| {
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(40));
+                hb.beat();
+            }
+            AppResult::Ok(7)
+        })
+        .await
+        .expect("steady");
+        assert_eq!(got, 7);
+        // No bound: waits for the work, errors pass through.
+        let e = watched(None, Arc::new(AtomicBool::new(false)), |_, _| AppResult::<()>::Err(AppError::invalid("x")))
+            .await
+            .expect_err("passes through");
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert_eq!(NETWORK_STALL, Duration::from_secs(15));
+    }
+
+    /// A `read_dir` whose `n`-th entry takes `delay` (a share that stops answering mid-folder).
+    struct Slow {
+        inner: std::fs::ReadDir,
+        read: usize,
+        stall_at: usize,
+        delay: Duration,
+    }
+
+    impl Iterator for Slow {
+        type Item = std::io::Result<std::fs::DirEntry>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.read += 1;
+            if self.read == self.stall_at {
+                std::thread::sleep(self.delay);
+            }
+            self.inner.next()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_size_scan_that_stalls_fails_with_network_did_not_respond() {
+        let d = ScratchDir::new("local-size-stall");
+        for i in 0..5 {
+            std::fs::write(d.0.join(format!("f{i}")), b"ab").expect("write");
+        }
+        let scan = |stall_at: usize, delay: Duration, bound: Duration| {
+            let p = s(&d.0);
+            watched(Some(bound), Arc::new(AtomicBool::new(false)), move |hb, stop| {
+                dir_size_with(&p, 100, stop, hb, |q: &Path| {
+                    std::fs::read_dir(q).map(|inner| Slow { inner, read: 0, stall_at, delay })
+                })
+            })
+        };
+        let started = Instant::now();
+        let e = scan(3, Duration::from_secs(2), Duration::from_millis(200)).await.expect_err("stalled");
+        assert_eq!((e.code, e.message.as_str()), (ErrorCode::Io, NETWORK_STALL_MESSAGE));
+        assert!(started.elapsed() < Duration::from_millis(1500), "{:?}", started.elapsed());
+        // A pause shorter than the bound is fine.
+        let got = scan(3, Duration::from_millis(50), Duration::from_millis(400)).await.expect("short pause");
+        assert_eq!(got, LocalDirSize { files: 5, bytes: 10, truncated: false });
+    }
+
+    #[test]
+    fn a_listing_beats_for_every_entry_and_stops_when_told() {
+        let d = ScratchDir::new("local-list-watched");
+        for i in 0..3 {
+            std::fs::write(d.0.join(format!("f{i}")), b"x").expect("write");
+        }
+        let hb = Heartbeat::new();
+        std::thread::sleep(Duration::from_millis(30));
+        let l = list_dir_watched(&s(&d.0), true, 10, &hb, &AtomicBool::new(false)).expect("list");
+        assert_eq!(l.files.len(), 3);
+        assert!(hb.idle() < Duration::from_millis(30));
+        assert!(list_dir_watched(&s(&d.0), true, 10, &hb, &AtomicBool::new(true)).expect_err("stopped").is_cancelled());
+    }
+
+    /// v0.9.1: nothing on a share goes to a recycle bin, whatever the spelling.
+    #[cfg(windows)]
+    #[test]
+    fn trash_refuses_every_network_path() {
+        let paths: Vec<String> = [r"\\server\share\f.txt", "//server/share/dir", r"\\server\share", r"\\?\UNC\server\share\f"]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let r = trash_paths(&paths).expect("trash");
+        assert_eq!(r.trashed, 0);
+        assert_eq!(r.failed.len(), paths.len());
+        for (f, p) in r.failed.iter().zip(&paths) {
+            assert_eq!((f.path.as_str(), f.message.as_str()), (p.as_str(), NO_NETWORK_TRASH));
+        }
+    }
+
+    /// A link on a local disk that leads to a share: the canonical-volume check refuses it. Needs
+    /// the right to create symbolic links and a reachable administrative share on this machine.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_to_a_share_is_refused_by_the_volume_check() {
+        let d = ScratchDir::new("local-trash-unc-link");
+        let share = r"\\localhost\C$\Windows";
+        if std::fs::metadata(share).is_err() {
+            println!("skipping: {share} is not reachable here");
+            return;
+        }
+        let link = d.0.join("to-share");
+        if let Err(e) = std::os::windows::fs::symlink_dir(share, &link) {
+            println!("skipping: cannot create a symbolic link here ({e})");
+            return;
+        }
+        let e = trash_drive(&link.join("win.ini")).expect_err("on a share");
+        assert!(e.contains("network share"), "{e}");
+        let r = trash_paths(&[s(&link.join("win.ini"))]).expect("trash");
+        assert_eq!(r.trashed, 0);
+        assert!(Path::new(share).join("win.ini").exists());
+    }
+
+    #[test]
+    fn drive_labels_show_the_share_of_a_mapped_drive() {
+        assert_eq!(drive_label('C', None), "C:");
+        assert_eq!(drive_label('Z', Some(r"\\nas\data")), r"Z: (\\nas\data)");
+        assert_eq!(drive_label('Y', Some("")), "Y:");
+        #[cfg(windows)]
+        assert_eq!(mapped_unc('C'), None, "a fixed disk is not mapped");
+    }
+
+    #[test]
+    fn network_roots_need_a_unc_target_and_a_name() {
+        if cfg!(windows) {
+            let r = network_root(" NAS media ", r"\\nas\media\films").expect("unc");
+            assert_eq!(r, LocalRoot { path: r"\\nas\media\films".into(), label: "NAS media".into(), kind: LocalRootKind::Network });
+            assert_eq!(serde_json::to_value(r).expect("ser")["kind"], "network");
+            assert!(network_root("x", "//nas/media").is_some());
+        }
+        for bad in [r"C:\Users", "https://example.com/dav", "ftp://host/", r"\\server", r"\\server\..\x", ""] {
+            assert_eq!(network_root("x", bad), None, "{bad}");
+        }
+        assert_eq!(network_root("  ", r"\\nas\media"), None);
+    }
+
+    #[test]
+    fn network_roots_go_after_the_drives_and_before_home() {
+        let root = |p: &str, kind| LocalRoot { path: p.into(), label: p.into(), kind };
+        let drives = vec![root("C", LocalRootKind::Drive), root("D", LocalRootKind::Drive), root("H", LocalRootKind::Home)];
+        let net = vec![root("N1", LocalRootKind::Network), root("N2", LocalRootKind::Network)];
+        let got: Vec<String> = merge_network(drives, net).into_iter().map(|r| r.path).collect();
+        assert_eq!(got, ["C", "D", "N1", "N2", "H"]);
+        // Capped, the home folder kept.
+        let many: Vec<LocalRoot> = (0..100).map(|i| root(&format!("N{i}"), LocalRootKind::Network)).collect();
+        let got = merge_network(vec![root("C", LocalRootKind::Drive), root("H", LocalRootKind::Home)], many);
+        assert_eq!(got.len(), ROOTS_MAX);
+        assert_eq!(got.last().map(|r| r.kind), Some(LocalRootKind::Home));
+        assert_eq!(got[0].path, "C");
+    }
+
+    /// A Network Shortcuts folder built in a scratch dir: entries whose `target.lnk` resolves to a
+    /// share are listed by folder name; a local target, a missing or broken shortcut is skipped.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn network_shortcuts_are_resolved_and_filtered() {
+        let d = ScratchDir::new("local-netshortcuts");
+        let make = |name: &str, target: &str| -> Result<(), String> {
+            let folder = d.0.join(name);
+            std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+            let lnk = folder.join("target.lnk");
+            let target = target.to_string();
+            // COM on a thread of its own, as in the app.
+            std::thread::spawn(move || {
+                let _com = crate::shell_link::ComApartment::init();
+                crate::shell_link::create(&lnk, &target)
+            })
+            .join()
+            .map_err(|_| "panicked".to_string())?
+        };
+        let local = d.0.join("local target");
+        std::fs::create_dir(&local).expect("mkdir");
+        if let Err(e) = make("Local folder", &local.to_string_lossy()) {
+            println!("skipping: could not create a shortcut through COM here ({e})");
+            return;
+        }
+        std::fs::create_dir(d.0.join("No shortcut")).expect("mkdir");
+        std::fs::create_dir(d.0.join("Broken")).expect("mkdir");
+        std::fs::write(d.0.join("Broken").join("target.lnk"), b"junk").expect("write");
+        // A share that does not exist: the shortcut stores its UNC path all the same.
+        let unc_ok = make("Team share", r"\\localhost\s3x-no-such-share\docs").is_ok();
+        let got = network_roots_in(d.0.clone(), NETWORK_STALL).await;
+        if unc_ok {
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!((got[0].label.as_str(), got[0].kind), ("Team share", LocalRootKind::Network));
+            assert!(got[0].path.to_ascii_lowercase().starts_with(r"\\localhost\s3x-no-such-share"), "{got:?}");
+        } else {
+            println!("skipping the share half: a shortcut to a UNC path could not be created here");
+            assert!(got.is_empty(), "{got:?}");
+        }
+        // A bound of zero returns at once with whatever arrived (here: nothing yet, or less).
+        let quick = network_roots_in(d.0.clone(), Duration::ZERO).await;
+        assert!(quick.len() <= got.len());
+        // A missing folder: no roots, no error.
+        assert!(network_roots_in(d.0.join("missing"), NETWORK_STALL).await.is_empty());
     }
 
     #[test]
@@ -1244,7 +1753,7 @@ mod tests {
             opened.fetch_add(1, Ordering::SeqCst);
             Ok(Counted { inner, live: live.clone() })
         };
-        let got = dir_size_with(&s(&d.0), LOCAL_DIR_SIZE_MAX_ENTRIES, &AtomicBool::new(false), open).expect("size");
+        let got = dir_size_with(&s(&d.0), LOCAL_DIR_SIZE_MAX_ENTRIES, &AtomicBool::new(false), &Heartbeat::new(), open).expect("size");
         assert_eq!(got, LocalDirSize { files: 2000, bytes: 4000, truncated: false });
         assert_eq!(opened.load(Ordering::SeqCst), 2001, "every folder once, plus the root");
         assert_eq!(most.load(Ordering::SeqCst), 1, "one directory handle at a time");
