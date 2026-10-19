@@ -10,6 +10,9 @@
 //! desktop shortcuts, but the process itself had no explicit AppUserModelID, so a launch that does
 //! not go through a shortcut (the installer's "Run" checkbox, the restart after an in-app update)
 //! was not tied to the pinned shortcut.
+//!
+//! v0.9.2: with that ID the taskbar takes the running button's icon from the Start-menu shortcut
+//! unless the window's property store names a relaunch icon ([`set_relaunch_properties`]).
 
 /// Sets the process-wide AppUserModelID to the bundle identifier, matching the ID the installers
 /// write on the shortcuts. Must run before the first window is created.
@@ -178,6 +181,102 @@ unsafe fn refresh_taskbar_button(hwnd: isize) {
     unsafe { ffi::SetWindowTextW(hwnd, buf.as_ptr()) };
 }
 
+/// The window's shell property store. Call on the window's thread (COM is initialized there by
+/// the webview).
+#[cfg(windows)]
+fn window_property_store(hwnd: isize) -> Result<windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreForWindow;
+    // SAFETY: a plain shell call on a window handle; an invalid handle is an error, not UB.
+    unsafe { SHGetPropertyStoreForWindow(HWND(hwnd as *mut core::ffi::c_void)) }
+        .map_err(|e| format!("SHGetPropertyStoreForWindow: {e}"))
+}
+
+/// The window's `System.AppUserModel.ID`, `None` when it has none (or it cannot be read).
+#[cfg(windows)]
+pub fn window_app_id(hwnd: isize) -> Option<String> {
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    let store = window_property_store(hwnd).ok()?;
+    // SAFETY: plain COM call; the union is read only after checking it is a VT_LPWSTR.
+    unsafe {
+        let pv = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
+        if pv.vt() != VT_LPWSTR {
+            return None;
+        }
+        pv.Anonymous.Anonymous.Anonymous.pwszVal.to_string().ok()
+    }
+}
+
+/// v0.9.2 "Taskbar icon follows the accent": gives the window its own AppUserModelID (the process
+/// keeps the plain identifier). With the process ID alone the taskbar resolves the running button's
+/// icon through the Start-menu shortcut carrying that ID and ignores the window's icons; a
+/// per-accent window ID matches no shortcut, so the button is drawn from the window. Changing the
+/// ID of an open window moves its button to the new group. Set in every build, also from the cargo
+/// target dir. Nothing is written when the window already has `app_id`.
+#[cfg(windows)]
+pub fn set_window_app_id(hwnd: isize, app_id: &str) -> Result<(), String> {
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    if window_app_id(hwnd).as_deref() == Some(app_id) {
+        return Ok(());
+    }
+    let store = window_property_store(hwnd)?;
+    let pv = lpwstr_propvariant(app_id)?;
+    // SAFETY: `pv` outlives the call; the store copies the value.
+    unsafe { store.SetValue(&PKEY_AppUserModel_ID, &pv) }.map_err(|e| format!("SetValue(System.AppUserModel.ID): {e}"))?;
+    // SAFETY: plain COM call on a live interface.
+    unsafe { store.Commit() }.map_err(|e| format!("IPropertyStore::Commit: {e}"))
+}
+
+/// v0.9.2: the relaunch properties of the window, so "Pin to taskbar" on the running window pins
+/// `icon_resource` (`"<file>,<index>"`) and `command`. Windows ignores the relaunch icon unless
+/// `RelaunchCommand` and `RelaunchDisplayNameResource` are set with it, and all three unless the
+/// window has its own AppUserModelID ([`set_window_app_id`], set first). Call on the window's
+/// thread.
+#[cfg(windows)]
+pub fn set_relaunch_properties(hwnd: isize, icon_resource: &str, command: &str, display_name: &str) -> Result<(), String> {
+    use windows::Win32::Storage::EnhancedStorage::{
+        PKEY_AppUserModel_RelaunchCommand, PKEY_AppUserModel_RelaunchDisplayNameResource,
+        PKEY_AppUserModel_RelaunchIconResource,
+    };
+    let store = window_property_store(hwnd)?;
+    let values = [
+        (PKEY_AppUserModel_RelaunchCommand, "RelaunchCommand", command),
+        (PKEY_AppUserModel_RelaunchDisplayNameResource, "RelaunchDisplayNameResource", display_name),
+        (PKEY_AppUserModel_RelaunchIconResource, "RelaunchIconResource", icon_resource),
+    ];
+    for (key, name, value) in values {
+        let pv = lpwstr_propvariant(value)?;
+        // SAFETY: `key` and `pv` outlive the call; the store copies the value.
+        unsafe { store.SetValue(&key, &pv) }.map_err(|e| format!("SetValue(System.AppUserModel.{name}): {e}"))?;
+    }
+    // SAFETY: plain COM call on a live interface.
+    unsafe { store.Commit() }.map_err(|e| format!("IPropertyStore::Commit: {e}"))
+}
+
+/// A `VT_LPWSTR` `PROPVARIANT` holding a CoTaskMem copy of `value` (what the AppUserModel keys
+/// require; `From<&str>` would make a `VT_BSTR`). Freed by `PropVariantClear` on drop.
+#[cfg(windows)]
+fn lpwstr_propvariant(value: &str) -> Result<windows::Win32::System::Com::StructuredStorage::PROPVARIANT, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    use windows::Win32::UI::Shell::SHStrDupW;
+
+    let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the copy is CoTaskMem-allocated.
+    let copy = unsafe { SHStrDupW(PCWSTR(wide.as_ptr())) }.map_err(|e| format!("SHStrDupW: {e}"))?;
+    let mut pv = PROPVARIANT::default();
+    // SAFETY: a default PROPVARIANT is VT_EMPTY; the union is set to a VT_LPWSTR that owns `copy`,
+    // which PropVariantClear (on drop) frees with CoTaskMemFree.
+    unsafe {
+        let inner = &mut pv.Anonymous.Anonymous;
+        inner.vt = VT_LPWSTR;
+        inner.Anonymous.pwszVal = copy;
+    }
+    Ok(pv)
+}
+
 #[cfg(windows)]
 fn running_from_cargo_target() -> bool {
     let Ok(exe) = tauri::utils::platform::current_exe() else {
@@ -233,6 +332,23 @@ mod ffi {
         pub fn SetClassLongPtrW(hwnd: isize, index: i32, value: isize) -> usize;
         pub fn GetWindowTextW(hwnd: isize, text: *mut u16, max: i32) -> i32;
         pub fn SetWindowTextW(hwnd: isize, text: *const u16) -> i32;
+        #[cfg(test)]
+        pub fn CreateWindowExW(
+            ex_style: u32,
+            class: *const u16,
+            name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            parent: isize,
+            menu: isize,
+            instance: isize,
+            param: *const core::ffi::c_void,
+        ) -> isize;
+        #[cfg(test)]
+        pub fn DestroyWindow(hwnd: isize) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -279,6 +395,76 @@ mod tests {
         assert!(set_window_icons_rgba(0, (&ok, 2, 2), (&[], 0, 0)).is_err());
         assert!(set_window_icons_rgba(0, (&ok, 2, 2), (&ok, 2, 3)).is_err());
         assert!(icon_from_rgba(&[0; 4 * 32 * 32 - 1], 32, 32).is_err());
+    }
+
+    #[test]
+    fn relaunch_values_are_lpwstr_propvariants() {
+        use windows::Win32::System::Variant::VT_LPWSTR;
+        for value in ["S3 Explorer", r#""C:\Program Files\S3 Explorer\s3explorer.exe""#, r"C:\x\icons\blue.ico,0", ""] {
+            let pv = lpwstr_propvariant(value).expect("propvariant");
+            assert_eq!(pv.vt(), VT_LPWSTR);
+            // SAFETY: just built as VT_LPWSTR with a NUL-terminated string.
+            let back = unsafe { pv.Anonymous.Anonymous.Anonymous.pwszVal.to_string() }.expect("utf-16");
+            assert_eq!(back, value);
+        }
+    }
+
+    /// No window (handle 0): an error, never a panic or a crash.
+    #[test]
+    fn relaunch_properties_without_a_window_fail_cleanly() {
+        assert!(set_relaunch_properties(0, r"C:\x.ico,0", r#""C:\x.exe""#, "S3 Explorer").is_err());
+        assert!(set_window_app_id(0, "dev.s3explorer.app.blue").is_err());
+        assert_eq!(window_app_id(0), None);
+    }
+
+    /// On a real (hidden, never shown) window the four values are stored as VT_LPWSTR and read back
+    /// unchanged from a fresh property store of that window.
+    #[test]
+    fn relaunch_properties_round_trip_on_a_real_window() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Storage::EnhancedStorage::{
+            PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand, PKEY_AppUserModel_RelaunchDisplayNameResource,
+            PKEY_AppUserModel_RelaunchIconResource,
+        };
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::Variant::VT_LPWSTR;
+        use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+
+        // Own thread: an STA like the app's main thread, without touching other tests' threads.
+        std::thread::spawn(|| {
+            let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: COM init on this thread, balanced below; a hidden top-level STATIC window
+            // destroyed before the thread ends.
+            unsafe {
+                assert!(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());
+                let hwnd = ffi::CreateWindowExW(0, class.as_ptr(), class.as_ptr(), 0, 0, 0, 10, 10, 0, 0, 0, std::ptr::null());
+                assert_ne!(hwnd, 0, "CreateWindowExW");
+                let (icon, cmd) = (r"C:\x\icons\red.ico,0", r#""C:\Program Files\S3 Explorer\s3explorer.exe""#);
+                assert_eq!(window_app_id(hwnd), None, "a new window has no ID");
+                set_window_app_id(hwnd, "dev.s3explorer.app.green").expect("first id");
+                assert_eq!(window_app_id(hwnd).as_deref(), Some("dev.s3explorer.app.green"));
+                // An accent change replaces it; the same ID again is a no-op.
+                set_window_app_id(hwnd, "dev.s3explorer.app.blue").expect("second id");
+                set_window_app_id(hwnd, "dev.s3explorer.app.blue").expect("same id");
+                set_relaunch_properties(hwnd, icon, cmd, "S3 Explorer").expect("set");
+                let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(hwnd as *mut core::ffi::c_void)).expect("store");
+                for (key, want) in [
+                    (PKEY_AppUserModel_ID, "dev.s3explorer.app.blue"),
+                    (PKEY_AppUserModel_RelaunchCommand, cmd),
+                    (PKEY_AppUserModel_RelaunchDisplayNameResource, "S3 Explorer"),
+                    (PKEY_AppUserModel_RelaunchIconResource, icon),
+                ] {
+                    let pv = store.GetValue(&key).expect("get");
+                    assert_eq!(pv.vt(), VT_LPWSTR, "{want}");
+                    assert_eq!(pv.Anonymous.Anonymous.Anonymous.pwszVal.to_string().expect("utf-16"), want);
+                }
+                drop(store);
+                ffi::DestroyWindow(hwnd);
+                CoUninitialize();
+            }
+        })
+        .join()
+        .expect("window thread");
     }
 
     #[test]

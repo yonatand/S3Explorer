@@ -20,7 +20,9 @@ pub async fn update_settings(state: State<'_, AppState>, settings: serde_json::V
 /// v0.9.0: the main window's icon (title bar and taskbar / Alt+Tab) in the accent colour, from the
 /// icons bundled in the executable. `accent` is taken as a string so an unknown one is
 /// `InvalidInput` (see `window_icon::parse_accent`). v0.9.1: on Windows the window class icons are
-/// replaced too and the taskbar button is refreshed (see `window_icon::apply`).
+/// replaced too and the taskbar button is refreshed (see `window_icon::apply`). v0.9.2: then the
+/// accent's `.ico` is written to the config dir and set as the window's relaunch icon, all in the
+/// one main-thread call below.
 #[tauri::command]
 pub async fn set_window_icon(app: tauri::AppHandle, accent: String) -> AppResult<()> {
     use tauri::Manager;
