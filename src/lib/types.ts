@@ -505,7 +505,7 @@ export type KeybindingsPreset = "commander" | "classic";
 
 export type PaneSource = { kind: "s3" } | { kind: "local" };
 
-export interface LocalRoot { path: string; label: string; kind: "drive" | "home" | "folder" }
+export interface LocalRoot { path: string; label: string; kind: "drive" | "home" | "folder" | "network" }
 
 export interface LocalEntry {
   name: string;

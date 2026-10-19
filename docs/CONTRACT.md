@@ -2352,3 +2352,49 @@ navigates.
 ### IAM permissions added in this version
 
 None. Moves from S3 to local use `DeleteObject(s)` after download, which the Delete row already covers.
+
+## v0.9.1 additions — network locations, taskbar icon
+
+### Network locations in a local pane
+
+A local pane can show a Windows network location: a UNC path (`\\server\share\folder`), a mapped network
+drive, or one of the user's saved **Network Locations** (the shortcuts Windows keeps under "This PC").
+
+- **Path rules change.** `\\server\share[\…]` (and the `//server/share` spelling) is now an accepted absolute
+  path in every local command and in the edit-path field and the command line. Device paths (`\\.\`,
+  `\\?\`), `\\server` without a share, and `..` components stay `InvalidInput`.
+- **`list_local_roots`** gains, after the drives: the saved Network Locations (Windows: the entries of
+  `%APPDATA%\Microsoft\Windows\Network Shortcuts`, each resolved from its `target.lnk` to its UNC target;
+  unresolvable ones skipped) with `kind: "network"` and the shortcut's name as label; mapped drives stay
+  drives but their label shows the UNC they map to (`Z: (\\nas\data)`). On macOS/Linux, mounted network
+  shares already appear as `"folder"` roots; nothing changes.
+- **Listing** a network location works like any directory, with one more bound: a listing or folder-size
+  scan on a UNC path that makes no progress for 15 s fails with `Io` ("network location did not respond")
+  instead of hanging the pane; the same bound applies to resolving a Network Location shortcut.
+- **Recycle bin:** network locations have none. `trash_local` refuses every UNC path (per-path failure
+  "no recycle bin on a network location; delete it in the file manager"), so nothing on a share is ever
+  deleted by this app. Moves *from* a share to S3 therefore upload only (the confirmation says the files
+  stay on the share); moves *to* a share from S3 delete from S3 as usual.
+- **Open / Show in folder / Calculate size / New folder / Rename** work on shares. `open_local`'s
+  browsed-file rule applies unchanged.
+- **UI:** the source menu (`Alt+F1`/`F2`) and the sidebar's "This computer" group list the network
+  locations after the drives with a network icon; the edit-path field and the command line accept a
+  typed `\\server\share\…`; a network path in the path bar shows a network icon in its first crumb.
+
+```ts
+// LocalRoot.kind (v0.9.1)
+kind: "drive" | "home" | "folder" | "network";
+```
+
+### Taskbar icon follows the accent (bug)
+
+`set_window_icon` changed the title-bar icon but the taskbar button kept the installed icon. On Windows the
+command now sets the window's small and big icons (`WM_SETICON`), **and the window class icons**
+(`GCLP_HICON`, `GCLP_HICONSM`), and notifies the shell so the taskbar button repaints; the previous
+accent's icons are destroyed after the swap. The startup icon is applied from the saved accent before the
+window is shown, so the taskbar never shows the installed icon first when the accent is not yellow. A pinned
+taskbar or Start-menu shortcut still shows the installer's icon (that is Windows reading the shortcut).
+
+### IAM permissions added in this version
+
+None.

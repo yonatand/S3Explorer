@@ -5,6 +5,14 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Network locations.** A local pane can open a network share: pick a saved Network Location or a mapped drive from `Alt+F1` / `Alt+F2` or the sidebar, or type a `\\server\share` path in the path field. Nothing on a share is ever deleted by the app (shares have no recycle bin), so a move from a share to S3 uploads and leaves the files in place.
+
+### Fixed
+
+- **The taskbar icon did not follow the accent colour**, only the title-bar icon did.
+
 ## [0.9.0] - 2026-10-14
 
 ### New
