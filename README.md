@@ -300,7 +300,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.9.1`:
+Honest status, as of `v0.9.2`:
 
 | | |
 |---|---|

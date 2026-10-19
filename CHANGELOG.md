@@ -5,6 +5,8 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-19
+
 ### Fixed
 
 - **The taskbar icon now really follows the accent colour in the installed app.** v0.9.1 fixed it only for development builds; installed builds have an application identity that made Windows take the button's icon from the Start-menu shortcut. The running window now carries its own identity per accent, so the button shows the accent icon at start and changes with it. A shortcut pinned to the taskbar keeps its own icon.
