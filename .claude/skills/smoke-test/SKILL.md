@@ -102,6 +102,27 @@ Chrome DevTools Protocol (`http://127.0.0.1:9223/json`). Native file dialogs can
 `window.__TAURI_INTERNALS__.invoke('start_upload' | 'start_download', ...)` from the page and assert on the UI.
 Never use SendKeys or other OS-level input automation: keystrokes can land in whatever window the user has focused.
 
+## Taskbar icon test (Windows)
+
+The taskbar button's icon cannot be read through an API; look at it. Run the app the way the installed build
+runs (with its AppUserModelID: a copy of the exe *outside* `src-tauri/target/`), drive it over WebView2's
+debugging port, and screenshot the taskbar DPI-aware.
+
+```bash
+npm run dev &                                   # the debug exe loads the UI from :1420
+cp src-tauri/target/debug/s3explorer.exe "$SCRATCH/app/"
+(cd "$SCRATCH/app" && WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9223" cmd //c start "" s3explorer.exe)
+# evaluate in the page (node, global WebSocket): fetch http://127.0.0.1:9223/json → webSocketDebuggerUrl → Runtime.evaluate
+#   window.__TAURI_INTERNALS__.invoke('set_window_icon', { accent: 'blue' })
+```
+
+Screenshot the bottom 64 px of the primary screen with PowerShell after `SetProcessDPIAware()` (without it the
+capture is offset on a scaled display): `[System.Windows.Forms.Screen]::PrimaryScreen.Bounds` +
+`Graphics.CopyFromScreen`, save PNG, crop and upscale the app-button area, then view the image. Compare before
+and after, and a fresh start with the accent saved. `update_settings` changes the user's real settings file:
+restore the accent afterwards. v0.9.2 lesson: with an AppUserModelID set, the taskbar takes the button's icon
+from the Start-menu shortcut; only a per-accent window ID (`<identifier>.<accent>`) makes it use the window's icon.
+
 ## Clean up
 Kill the server (`TaskStop`, or `taskkill //F //IM weed.exe`). Leave the binary cached in the
 scratchpad so the next run skips the download. Never commit test data.

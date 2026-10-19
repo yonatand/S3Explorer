@@ -2406,6 +2406,12 @@ button of an app grouped by ID. This is done at startup (before the window shows
 after the window and class icons. A shortcut pinned to the taskbar keeps the icon it was pinned with; the app
 never edits shortcuts.
 
+**Verified 2026-10-19:** the relaunch properties alone do not change the running button; what does is giving the
+*window* its own `System.AppUserModel.ID` = `<identifier>.<accent>` (the process keeps the plain identifier for
+notifications), set before the window is shown and on every accent change, before the icons. With that, the
+button shows the saved accent at start and switches live; no hide/show of the window is needed. Tested with the
+taskbar screenshot procedure in the `smoke-test` skill.
+
 ### IAM permissions added in this version
 
 None.
