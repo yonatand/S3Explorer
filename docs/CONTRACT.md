@@ -1567,6 +1567,12 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 `~/.aws/login/cache`; an expired session surfaces as an `Auth` error whose message tells the user to run
 `aws login` again.
 
+**v0.9.3:** the message is "Your AWS sign-in has expired. Run `aws login --profile <name>` in a terminal, sign in,
+then connect again." (`aws sso login` for IAM Identity Center profiles), followed by a blank line and
+"Details: <the SDK text, at most 500 characters>"; other credential failures read "Could not load credentials for
+profile <name>: <first sentence>" with the same details. The backend derives the wording from the SDK error text
+(login token / refresh token expired / session expired → `aws login`; SSO token expired → `aws sso login`).
+
 #### IAM permissions added in this version
 
 None.
