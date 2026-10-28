@@ -99,6 +99,11 @@ impl Connection {
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
             .build();
+        // The profile name, so a credentials failure of the first request names the command to run.
+        let profile_name = match &config {
+            ConnectionConfig::Profile { profile, .. } => Some(profile.trim().to_string()),
+            ConnectionConfig::Static { .. } => None,
+        };
         let (sdk_config, label, endpoint, force_path_style, identity) = match config {
             ConnectionConfig::Profile { profile, region, endpoint } => {
                 let profile = profile.trim().to_string();
@@ -158,7 +163,7 @@ impl Connection {
         let can_list_buckets = match base_client.list_buckets().send().await {
             Ok(_) => true,
             Err(e) => {
-                let err = AppError::from(e);
+                let err = AppError::from_sdk(e, profile_name.as_deref());
                 if !is_access_denied(&err) {
                     return Err(err);
                 }

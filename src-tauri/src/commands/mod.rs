@@ -1,5 +1,6 @@
 //! Tauri command layer: thin wrappers over `ops`, `state`, `transfers` and `jobs`.
 
+pub mod aws_login;
 pub mod batches;
 pub mod browse;
 pub mod buckets;

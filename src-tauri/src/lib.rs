@@ -5,6 +5,7 @@
 //! the Tauri glue is in `commands`.
 
 pub mod archive;
+pub mod aws_login;
 pub mod batches;
 pub mod buckets;
 pub mod commands;
@@ -158,6 +159,7 @@ pub fn run() {
             app.manage(added);
             app.manage(connections);
             app.manage(UpdaterState::default());
+            app.manage(commands::aws_login::AwsLoginState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -165,6 +167,8 @@ pub fn run() {
             commands::connection::connect,
             commands::connection::disconnect,
             commands::connection::connection_status,
+            commands::aws_login::start_aws_login,
+            commands::aws_login::cancel_aws_login,
             commands::browse::list_buckets,
             commands::browse::list_objects,
             commands::browse::list_recent,
@@ -240,12 +244,19 @@ pub fn run() {
             // transfer and job, so no multipart upload or temp file is left behind (abort what you
             // start). Bounded by EXIT_WAIT.
             if let tauri::RunEvent::Exit = event {
+                // A running `aws login` is killed with the app (kill_on_drop alone needs the task to drop).
+                if let Some(login) = app.try_state::<commands::aws_login::AwsLoginState>() {
+                    tauri::async_runtime::block_on(login.0.cancel_any_and_wait(AWS_LOGIN_EXIT_WAIT));
+                }
                 if let Some(state) = app.try_state::<AppState>() {
                     tauri::async_runtime::block_on(state.cancel_active_and_wait(EXIT_WAIT));
                 }
             }
         });
 }
+
+/// How long app exit waits for a running `aws login` to be killed.
+const AWS_LOGIN_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long app exit waits for active transfers and jobs to clean up.
 const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
