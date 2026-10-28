@@ -29,7 +29,7 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 
 ## What it does
 
-- **Connect** with an AWS profile from `~/.aws` (including profiles signed in with `aws sso login` or the newer `aws login`), or with access keys. A custom endpoint makes it work with MinIO, Cloudflare R2, SeaweedFS, LocalStack and friends.
+- **Connect** with an AWS profile from `~/.aws` (including profiles signed in with `aws sso login` or the newer `aws login`; when such a session has expired the app says so and can run the sign-in for you through the AWS CLI), or with access keys. A custom endpoint makes it work with MinIO, Cloudflare R2, SeaweedFS, LocalStack and friends.
 - **List buckets**, including buckets in other regions. A bucket shared with you from another account can be added by name, `s3://` address or ARN (the "+" above the bucket list) and used like any other.
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
 - **Look inside a file without downloading it.** Selecting a text file or an image shows a preview in the details panel: JSON pretty-printed, CSV and TSV as a table, images fitted to the panel. `F3` (Quick look) opens a big view you can flip through with the arrow keys. Only the start of a large text file is read, and a setting turns automatic previews off.
@@ -300,7 +300,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.9.2`:
+Honest status, as of `v0.9.3`:
 
 | | |
 |---|---|
