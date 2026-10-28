@@ -7832,3 +7832,56 @@ kbd {
   color: var(--warning);
   background: color-mix(in srgb, var(--warning) 14%, transparent);
 }
+
+/* Sign in again with the AWS CLI (v0.9.3) */
+.signin-error .form-error-body {
+  flex: 1;
+  min-width: 0;
+}
+.signin-headline code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.signin-details-toggle {
+  margin: -4px 0 -4px -4px;
+}
+.signin-details {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.signin-log {
+  align-self: stretch;
+  margin: 0;
+  max-height: 150px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.signin-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.form-error-body .signin-btn {
+  color: var(--btn-primary-fg);
+}
+.signin-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+}

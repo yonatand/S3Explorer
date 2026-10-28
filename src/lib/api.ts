@@ -12,6 +12,8 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  AWS_LOGIN_DONE_EVENT,
+  AWS_LOGIN_OUTPUT_EVENT,
   BATCH_PROGRESS_EVENT,
   JOB_PROGRESS_EVENT,
   LAUNCH_OPEN_EVENT,
@@ -20,6 +22,9 @@ import {
   type AddedBucket,
   type AppError,
   type AppSettings,
+  type AwsLoginDone,
+  type AwsLoginKind,
+  type AwsLoginOutput,
   type Batch,
   type BatchPlanRequest,
   type BatchPreview,
@@ -203,6 +208,11 @@ export interface Backend {
   setWindowIcon(accent: AccentColor): Promise<void>;
   takeLaunchRequest(): Promise<LaunchRequest | null>;
   onLaunchOpen(cb: (req: LaunchRequest) => void): Promise<Unlisten>;
+  // v0.9.3: sign in again with the AWS CLI (see "Profiles from `aws login`" in docs/CONTRACT.md)
+  startAwsLogin(profile: string, kind: AwsLoginKind): Promise<{ runId: string }>;
+  cancelAwsLogin(runId: string): Promise<void>;
+  onAwsLoginOutput(cb: (e: AwsLoginOutput) => void): Promise<Unlisten>;
+  onAwsLoginDone(cb: (e: AwsLoginDone) => void): Promise<Unlisten>;
 }
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -386,6 +396,10 @@ const tauriBackend: Backend = {
   setWindowIcon: (accent) => invoke<void>("set_window_icon", { accent }),
   takeLaunchRequest: () => invoke<LaunchRequest | null>("take_launch_request"),
   onLaunchOpen: (cb) => listen<LaunchRequest>(LAUNCH_OPEN_EVENT, (e) => cb(e.payload)),
+  startAwsLogin: (profile, kind) => invoke<{ runId: string }>("start_aws_login", { profile, kind }),
+  cancelAwsLogin: (runId) => invoke<void>("cancel_aws_login", { runId }),
+  onAwsLoginOutput: (cb) => listen<AwsLoginOutput>(AWS_LOGIN_OUTPUT_EVENT, (e) => cb(e.payload)),
+  onAwsLoginDone: (cb) => listen<AwsLoginDone>(AWS_LOGIN_DONE_EVENT, (e) => cb(e.payload)),
   onFileDrop: (cb) =>
     getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload;
@@ -613,3 +627,16 @@ export const setWindowIcon = (accent: AccentColor) => call("setWindowIcon", acce
 export const takeLaunchRequest = () => call("takeLaunchRequest");
 /** A second launch handed its arguments to this running instance (single instance). */
 export const onLaunchOpen = (cb: (req: LaunchRequest) => void) => call("onLaunchOpen", cb);
+
+// ---- sign in again with the AWS CLI (v0.9.3) ---------------------------------------------------
+/**
+ * Run `aws login --profile <profile>` (or `aws sso login`) for the user. One run at a time
+ * (`Conflict`); `InvalidInput` when the CLI is missing or the profile name is invalid.
+ */
+export const startAwsLogin = (profile: string, kind: AwsLoginKind) => call("startAwsLogin", profile, kind);
+/** Kill the running CLI; no-op when it already ended. */
+export const cancelAwsLogin = (runId: string) => call("cancelAwsLogin", runId);
+/** Each line the CLI prints (stdout and stderr). */
+export const onAwsLoginOutput = (cb: (e: AwsLoginOutput) => void) => call("onAwsLoginOutput", cb);
+/** The run ended: exit code, cancelled, or timed out after 10 minutes. */
+export const onAwsLoginDone = (cb: (e: AwsLoginDone) => void) => call("onAwsLoginDone", cb);

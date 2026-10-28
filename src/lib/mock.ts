@@ -7,6 +7,9 @@ import type {
   AddedBucket,
   AppSettings,
   AppError,
+  AwsLoginDone,
+  AwsLoginKind,
+  AwsLoginOutput,
   Batch,
   BatchPlanRequest,
   BatchPreview,
@@ -2970,6 +2973,85 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   },
 });
 
+// ---- sign in again with the AWS CLI (v0.9.3) ------------------------------------------------
+/** Profiles whose `aws login` / `aws sso login` session has expired (set by `__s3xMock.expireLogin`). */
+const expiredLogins = new Map<string, AwsLoginKind>();
+/** The backend's wording (see "Profiles from `aws login`" in docs/CONTRACT.md). */
+function expiredLoginMessage(profile: string, kind: AwsLoginKind): string {
+  const cmd = kind === "sso" ? "aws sso login" : "aws login";
+  const sdk =
+    kind === "sso"
+      ? "the SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile."
+      : "failed to load credentials from the login cache: the refresh token has expired; run `aws login` to sign in again";
+  return `Your AWS sign-in has expired. Run \`${cmd} --profile ${profile}\` in a terminal, sign in, then connect again.\n\nDetails: ${sdk}`;
+}
+const awsLoginCallLog: { cmd: "start_aws_login" | "cancel_aws_login"; profile?: string; kind?: AwsLoginKind; runId: string; at: string }[] = [];
+const awsLoginOutputListeners = new Set<(e: AwsLoginOutput) => void>();
+const awsLoginDoneListeners = new Set<(e: AwsLoginDone) => void>();
+let awsLoginRun: { runId: string; timers: ReturnType<typeof setTimeout>[] } | null = null;
+let awsLoginSeq = 0;
+
+function finishAwsLogin(runId: string, done: Omit<AwsLoginDone, "runId">) {
+  if (awsLoginRun?.runId !== runId) return;
+  for (const t of awsLoginRun.timers) clearTimeout(t);
+  awsLoginRun = null;
+  const e: AwsLoginDone = { runId, ...done };
+  for (const cb of awsLoginDoneListeners) cb(e);
+}
+
+/**
+ * Mock CLI run: three lines over ~1.5 s, then exit 0 (clears the profile's expired session). A
+ * profile containing "fail" exits 3, "timeout" times out, "hang" runs until cancelled.
+ */
+function startMockAwsLogin(profile: string, kind: AwsLoginKind): string {
+  const runId = `login-${++awsLoginSeq}`;
+  const run = { runId, timers: [] as ReturnType<typeof setTimeout>[] };
+  awsLoginRun = run;
+  const lines =
+    kind === "sso"
+      ? [
+          "Attempting to automatically open the SSO authorization page in your default browser.",
+          "If the browser does not open, open the following URL: https://device.sso.us-east-1.amazonaws.com/",
+          "Then enter the code: ABCD-EFGH",
+        ]
+      : [
+          "Attempting to open your default browser.",
+          "If the browser does not open, open the following URL: https://signin.aws.amazon.com/login?x=mock",
+          "Waiting for sign-in to complete…",
+        ];
+  const out = (line: string) => {
+    if (awsLoginRun !== run) return;
+    for (const cb of awsLoginOutputListeners) cb({ runId, line });
+  };
+  lines.forEach((l, i) => run.timers.push(setTimeout(() => out(l), 300 + i * 400)));
+  if (profile.includes("hang")) return runId;
+  run.timers.push(
+    setTimeout(() => {
+      if (profile.includes("fail")) {
+        out("Error when retrieving token from sso: Token has expired and refresh failed");
+        finishAwsLogin(runId, { exitCode: 3, cancelled: false, timedOut: false });
+      } else if (profile.includes("timeout")) {
+        finishAwsLogin(runId, { exitCode: null, cancelled: false, timedOut: true });
+      } else {
+        out(`Successfully logged in as profile ${profile}.`);
+        expiredLogins.delete(profile);
+        finishAwsLogin(runId, { exitCode: 0, cancelled: false, timedOut: false });
+      }
+    }, 1500),
+  );
+  return runId;
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  awsLoginCalls: awsLoginCallLog,
+  /** Make connecting with `profile` fail with the expired-sign-in error (adds the profile when missing). */
+  expireLogin: (profile: string, kind: AwsLoginKind = "login") => {
+    if (!profiles.some((p) => p.name === profile)) profiles.push({ name: profile, region: "us-east-1", hasCredentials: true });
+    expiredLogins.set(profile, kind);
+  },
+  awsLoginRunning: () => awsLoginRun?.runId ?? null,
+});
+
 export const mockBackend: Backend = {
   async listProfiles() {
     await latency();
@@ -2982,6 +3064,8 @@ export const mockBackend: Backend = {
       const p = profiles.find((x) => x.name === config.profile);
       if (!p) throw fail("InvalidInput", `Profile “${config.profile}” not found in ~/.aws/config.`);
       if (!p.hasCredentials) throw fail("Auth", `Profile “${p.name}” has no credentials. Run “aws sso login --profile ${p.name}”.`);
+      const expired = expiredLogins.get(p.name);
+      if (expired) throw fail("Auth", expiredLoginMessage(p.name, expired));
       connectionKey = `profile:${p.name}@${withScheme(config.endpoint) ?? (p.name === "minio-local" ? "http://localhost:9000" : "aws")}`;
       connection = {
         label: p.name,
@@ -3977,6 +4061,36 @@ export const mockBackend: Backend = {
     launchListeners.add(cb);
     return () => {
       launchListeners.delete(cb);
+    };
+  },
+
+  async startAwsLogin(profile, kind) {
+    await delay(80);
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(profile)) throw fail("InvalidInput", `“${profile}” is not a valid profile name.`);
+    if (kind !== "login" && kind !== "sso") throw fail("InvalidInput", "kind must be login or sso");
+    if (awsLoginRun) throw fail("Conflict", "A sign-in is already running.");
+    const runId = startMockAwsLogin(profile, kind);
+    awsLoginCallLog.push({ cmd: "start_aws_login", profile, kind, runId, at: new Date().toISOString() });
+    return { runId };
+  },
+
+  async cancelAwsLogin(runId) {
+    await delay(30);
+    awsLoginCallLog.push({ cmd: "cancel_aws_login", runId, at: new Date().toISOString() });
+    finishAwsLogin(runId, { exitCode: null, cancelled: true, timedOut: false });
+  },
+
+  async onAwsLoginOutput(cb) {
+    awsLoginOutputListeners.add(cb);
+    return () => {
+      awsLoginOutputListeners.delete(cb);
+    };
+  },
+
+  async onAwsLoginDone(cb) {
+    awsLoginDoneListeners.add(cb);
+    return () => {
+      awsLoginDoneListeners.delete(cb);
     };
   },
 

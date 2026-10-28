@@ -33,6 +33,9 @@ import * as api from "../lib/api";
 import {
   SAVED_CONNECTION_NAME_MAX,
   type AppError,
+  type AwsLoginDone,
+  type AwsLoginKind,
+  type AwsLoginOutput,
   type ConnectionConfig,
   type ProfileInfo,
   type SavedConnection,
@@ -111,6 +114,67 @@ function describeError(e: AppError, during: "save" | "connect"): string {
       ? "Couldn't save to your operating system's keychain."
       : "Couldn't read the secret key from your operating system's keychain.";
   return `${what} The keychain may be locked or unavailable. Unlock it (or sign in to your desktop session) and try again. Details: ${e.message}`;
+}
+
+// ---- expired aws login / sso session (v0.9.3) -----------------------------------------------
+
+/** The backend's wording for an expired `aws login` / `aws sso login` session. */
+const EXPIRED_PREFIX = "Your AWS sign-in has expired";
+/** The sign-in log shows at most this many of the CLI's lines, newest last. */
+const SIGNIN_LOG_LINES = 20;
+
+interface ExpiredSession {
+  headline: string;
+  /** The SDK's text after "Details: " (empty when the backend sent none). */
+  details: string;
+  kind: AwsLoginKind;
+}
+
+function parseExpired(e: AppError | null): ExpiredSession | null {
+  if (!e || e.code !== "Auth" || !e.message.startsWith(EXPIRED_PREFIX)) return null;
+  const [headline, ...rest] = e.message.split(/\r?\n\s*\r?\n/);
+  return {
+    headline: headline.trim(),
+    details: rest.join("\n\n").trim().replace(/^Details:\s*/, ""),
+    kind: /aws sso login/.test(e.message) ? "sso" : "login",
+  };
+}
+
+/** `code` spans in the backend's message become <code>. */
+function withCode(text: string) {
+  return text.split("`").map((part, i) => (i % 2 ? <code key={i}>{part}</code> : <span key={i}>{part}</span>));
+}
+
+type SignInStatus = "starting" | "running" | "failed" | "cancelled" | "timedOut" | "error";
+interface SignInState {
+  status: SignInStatus;
+  lines: string[];
+  exitCode?: number | null;
+  /** Why the CLI could not be started. */
+  message?: string;
+}
+interface SignInRun {
+  /** Null until `start_aws_login` answers; events that arrive before are buffered and replayed. */
+  runId: string | null;
+  buffer: (AwsLoginOutput | AwsLoginDone)[];
+  /** Cancel the run as soon as its id is known. */
+  cancel: boolean;
+}
+const signInActive = (s: SignInState | null) => s?.status === "starting" || s?.status === "running";
+
+function signInOutcome(s: SignInState): string | null {
+  switch (s.status) {
+    case "failed":
+      return s.exitCode == null ? "Sign in failed." : `Sign in failed (exit ${s.exitCode}).`;
+    case "cancelled":
+      return "Sign in cancelled.";
+    case "timedOut":
+      return "Sign in timed out after 10 minutes.";
+    case "error":
+      return s.message ?? "Couldn't start the AWS CLI.";
+    default:
+      return null;
+  }
 }
 
 const isMissingSecret = (e: AppError, c: SavedConnection) =>
@@ -461,11 +525,108 @@ export function ConnectScreen() {
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
+  // Sign in again (v0.9.3): the profile of the failed attempt, how to retry it, and the CLI run.
+  const [attemptProfile, setAttemptProfile] = useState<string | null>(null);
+  const retryRef = useRef<(() => void) | null>(null);
+  const [signIn, setSignIn] = useState<SignInState | null>(null);
+  const [showDetails, setShowDetails] = useState(false);
+  const runRef = useRef<SignInRun | null>(null);
 
   const nameRef = useRef<HTMLInputElement>(null);
   const secretRef = useRef<HTMLInputElement>(null);
   const cardRef = useRef<HTMLFormElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+
+  const onSignInEvent = (e: AwsLoginOutput | AwsLoginDone) => {
+    const run = runRef.current;
+    if (!run) return;
+    if (run.runId === null) {
+      run.buffer.push(e);
+      return;
+    }
+    if (e.runId !== run.runId) return;
+    if ("line" in e) {
+      setSignIn((cur) => (cur ? { ...cur, status: "running", lines: [...cur.lines, e.line].slice(-SIGNIN_LOG_LINES) } : cur));
+      return;
+    }
+    runRef.current = null;
+    if (e.exitCode === 0 && !e.cancelled && !e.timedOut) {
+      setSignIn(null);
+      retryRef.current?.();
+      return;
+    }
+    const status: SignInStatus = e.cancelled ? "cancelled" : e.timedOut ? "timedOut" : "failed";
+    setSignIn((cur) => ({ lines: cur?.lines ?? [], status, exitCode: e.exitCode }));
+  };
+  // The listeners are registered once; the handler they call is always the latest render's.
+  const onSignInEventRef = useRef(onSignInEvent);
+  onSignInEventRef.current = onSignInEvent;
+
+  useEffect(() => {
+    let alive = true;
+    const unlisten: api.Unlisten[] = [];
+    const keep = (u: api.Unlisten) => {
+      if (alive) unlisten.push(u);
+      else u();
+    };
+    void api.onAwsLoginOutput((e) => onSignInEventRef.current(e)).then(keep, () => undefined);
+    void api.onAwsLoginDone((e) => onSignInEventRef.current(e)).then(keep, () => undefined);
+    return () => {
+      alive = false;
+      unlisten.forEach((u) => u());
+      // Leaving the connect screen cancels a running sign-in.
+      const run = runRef.current;
+      runRef.current = null;
+      if (run?.runId) void api.cancelAwsLogin(run.runId).catch(() => undefined);
+      else if (run) run.cancel = true;
+    };
+  }, []);
+
+  /** Cancel a running sign-in (if any) and forget its state. */
+  const stopSignIn = () => {
+    const run = runRef.current;
+    runRef.current = null;
+    if (run?.runId) void api.cancelAwsLogin(run.runId).catch(() => undefined);
+    else if (run) run.cancel = true;
+    setSignIn(null);
+  };
+
+  const startSignIn = async (profileName: string, kind: AwsLoginKind) => {
+    if (runRef.current) return;
+    const run: SignInRun = { runId: null, buffer: [], cancel: false };
+    runRef.current = run;
+    setSignIn({ status: "starting", lines: [] });
+    try {
+      const { runId } = await api.startAwsLogin(profileName, kind);
+      if (run.cancel || runRef.current !== run) {
+        // Cancelled, or the screen was left, before the run had an id.
+        void api.cancelAwsLogin(runId).catch(() => undefined);
+        return;
+      }
+      run.runId = runId;
+      setSignIn((cur) => (cur ? { ...cur, status: "running" } : cur));
+      const buffered = run.buffer;
+      run.buffer = [];
+      for (const e of buffered) if (e.runId === runId) onSignInEvent(e);
+    } catch (e) {
+      if (runRef.current !== run) return;
+      runRef.current = null;
+      setSignIn({ status: "error", lines: [], message: (e as AppError).message });
+    }
+  };
+
+  const cancelSignIn = () => {
+    const run = runRef.current;
+    if (!run) return;
+    if (run.runId) {
+      // The done event (cancelled: true) settles the state.
+      void api.cancelAwsLogin(run.runId).catch(() => undefined);
+    } else {
+      run.cancel = true;
+      runRef.current = null;
+      setSignIn((cur) => ({ lines: cur?.lines ?? [], status: "cancelled" }));
+    }
+  };
 
   const loadProfiles = async () => {
     setProfiles(null);
@@ -531,7 +692,8 @@ export function ConnectScreen() {
     },
   );
 
-  const busy = connecting || busyId !== null;
+  const signingIn = signInActive(signIn);
+  const busy = connecting || busyId !== null || signingIn;
   const hasSaved = !!saved && saved.length > 0;
   const tokenEntered = mode === "static" && !!sessionToken.trim();
   /** Saving applies: always while editing; otherwise when the box is checked and no session token blocks it. */
@@ -564,6 +726,11 @@ export function ConnectScreen() {
   const showNameError = !!nameError && (nameTouched || !!trimmedName);
 
   const clearErrors = () => {
+    // Starting another connection (or leaving this view) cancels a running sign-in.
+    stopSignIn();
+    setShowDetails(false);
+    setAttemptProfile(null);
+    retryRef.current = null;
     setError(null);
     setErrorText(null);
     setSaveError(null);
@@ -664,12 +831,15 @@ export function ConnectScreen() {
       }
       setError(err);
       setErrorText(describeError(err, "connect"));
+      setAttemptProfile(fresh.kind === "profile" ? (fresh.profile ?? null) : null);
+      retryRef.current = () => void connectSaved(fresh, fromForm);
       if (fromForm) setEditing(fresh);
     }
   };
 
-  const connectWithoutSaving = async () => {
-    const config = buildConfig();
+  /** `again`: retry exactly this configuration (after Sign in again). */
+  const connectWithoutSaving = async (again?: ConnectionConfig) => {
+    const config = again ?? buildConfig();
     setConnecting(true);
     clearErrors();
     try {
@@ -689,6 +859,8 @@ export function ConnectScreen() {
     } catch (err) {
       setError(err as AppError);
       setErrorText((err as AppError).message);
+      setAttemptProfile(config.kind === "profile" ? config.profile : null);
+      retryRef.current = () => void connectWithoutSaving(config);
       setConnecting(false);
     }
   };
@@ -760,7 +932,65 @@ export function ConnectScreen() {
     </div>
   );
 
-  const errorBox = (error || savedError) && (
+  const expired = parseExpired(error);
+  const signInLines = signIn?.lines ?? [];
+  const signInNote = signIn && signInOutcome(signIn);
+  const errorBox = expired ? (
+    <div className="form-error signin-error" role="alert">
+      <AlertCircle size={15} />
+      <div className="form-error-body">
+        <span className="signin-headline">{withCode(expired.headline)}</span>
+        {expired.details && (
+          <>
+            <button
+              type="button"
+              className="link-btn signin-details-toggle"
+              aria-expanded={showDetails}
+              aria-controls="signin-details"
+              onClick={() => setShowDetails((v) => !v)}
+            >
+              <ChevronRight size={12} className={showDetails ? "rot90" : ""} />
+              {showDetails ? "Hide details" : "Show details"}
+            </button>
+            {showDetails && (
+              <p id="signin-details" className="signin-details">
+                {expired.details}
+              </p>
+            )}
+          </>
+        )}
+        {signInLines.length > 0 && (
+          <pre className="signin-log" aria-label="AWS CLI output" aria-live="polite">
+            {signInLines.join("\n")}
+          </pre>
+        )}
+        {signInNote && <strong className="signin-outcome">{signInNote}</strong>}
+        {attemptProfile && (
+          <div className="signin-actions">
+            {signingIn ? (
+              <>
+                <button type="button" className="btn signin-cancel" onClick={cancelSignIn}>
+                  Cancel
+                </button>
+                <span className="signin-wait">
+                  <Loader2 size={13} className="spin" /> Finish signing in in your browser…
+                </span>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-primary signin-btn"
+                onClick={() => void startSignIn(attemptProfile, expired.kind)}
+                disabled={connecting || busyId !== null}
+              >
+                <LogIn size={14} /> Sign in again
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  ) : (error || savedError) && (
     <div className="form-error" role="alert">
       <AlertCircle size={15} />
       <span>{errorText ?? error?.message ?? `Couldn't load saved connections: ${savedError?.message}`}</span>
