@@ -1573,6 +1573,24 @@ then connect again." (`aws sso login` for IAM Identity Center profiles), followe
 profile <name>: <first sentence>" with the same details. The backend derives the wording from the SDK error text
 (login token / refresh token expired / session expired → `aws login`; SSO token expired → `aws sso login`).
 
+**Sign in again from the app (v0.9.3).** The connect screen's expired-session error gets a **Sign in again**
+button that runs the AWS CLI for the user:
+
+| Command | Args | Returns |
+|---|---|---|
+| `start_aws_login` | `{ profile: string, kind: "login" \| "sso" }` | `{ runId: string }`. Spawns `aws login --profile <profile>` (or `aws sso login --profile <profile>`) with the `aws` executable found on `PATH` (same lookup rules as the file manager: absolute path or bare name with PATHEXT, no shell, shells refused), stdin closed, stdout/stderr captured; `InvalidInput` when the CLI is not found ("The AWS CLI is not installed or not on PATH") or the profile name is not a valid profile name (`[A-Za-z0-9_.-]`, 1..=64). One run at a time: a second call while one runs is `Conflict`. |
+| `cancel_aws_login` | `{ runId }` | `void`. Kills the CLI process; no-op when it already ended. |
+
+| Event | Payload |
+|---|---|
+| `aws-login:output` | `{ runId, line }` — each line the CLI prints (stdout and stderr), so the user sees the URL / code the CLI shows. |
+| `aws-login:done` | `{ runId, exitCode: number \| null, cancelled: boolean, timedOut: boolean }`. The run is bounded to **10 minutes**; past that it is killed and `timedOut` is true. |
+
+- The frontend shows the output lines in the error card while the run is active, with **Cancel**; on
+  `exitCode === 0` it retries the connection automatically with the same profile; otherwise it keeps the
+  error with the CLI's last lines. The CLI opens the browser itself; the app never handles credentials.
+- Disconnecting or closing the connect screen cancels a running sign-in.
+
 #### IAM permissions added in this version
 
 None.

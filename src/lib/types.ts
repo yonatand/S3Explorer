@@ -539,6 +539,19 @@ export interface LaunchRequest {
 
 export const LAUNCH_OPEN_EVENT = "launch:open";
 
+// ---- v0.9.3: sign in again from the app (see "Profiles from aws login" in docs/CONTRACT.md) ----
+
+/** Which CLI command signs the profile in: `aws login` or `aws sso login`. */
+export type AwsLoginKind = "login" | "sso";
+
+export interface AwsLoginOutput { runId: string; line: string }
+export interface AwsLoginDone { runId: string; exitCode: number | null; cancelled: boolean; timedOut: boolean }
+
+export const AWS_LOGIN_OUTPUT_EVENT = "aws-login:output";
+export const AWS_LOGIN_DONE_EVENT = "aws-login:done";
+/** The CLI run is killed after this long. */
+export const AWS_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** Limits for `AppSettings.keybindings` and the export/import file (see "Keyboard" in docs/CONTRACT.md). */
 export const KEYBINDING_LIMITS = {
   maxActions: 200,

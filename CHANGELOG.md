@@ -8,6 +8,7 @@ The section for a version becomes the text of its GitHub Release.
 ### Fixed
 
 - **An expired `aws login` or `aws sso login` session showed a wall of technical text.** Connecting with such a profile now says plainly that the sign-in has expired and which command to run (`aws login --profile <name>` or `aws sso login --profile <name>`), with the technical details underneath.
+- **Sign in again without leaving the app.** That error now has a *Sign in again* button that runs the AWS CLI's sign-in for you (the browser opens as usual), shows what the CLI prints, and reconnects when it succeeds. It needs the AWS CLI installed, which `aws login` users already have.
 
 ## [0.9.2] - 2026-10-19
 
